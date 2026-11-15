@@ -1,0 +1,118 @@
+{
+  "format_version": 1,
+  "badger_version": "v4.9.6",
+  "fixtures": [
+    {
+      "name": "basic",
+      "kind": "db",
+      "description": "8k small inline values plus binary keys, no compression",
+      "path": "db/basic",
+      "expected": "db/basic.json"
+    },
+    {
+      "name": "vlog",
+      "kind": "db",
+      "description": "2.5k values, most above the 64-byte value threshold; several vlog files",
+      "path": "db/vlog",
+      "expected": "db/vlog.json"
+    },
+    {
+      "name": "versions",
+      "kind": "db",
+      "description": "multiple versions, deletes, expiry, user meta, discard-earlier-versions",
+      "path": "db/versions",
+      "expected": "db/versions.json"
+    },
+    {
+      "name": "snappy",
+      "kind": "db",
+      "description": "compressible values, snappy block compression, some vlog values",
+      "path": "db/snappy",
+      "expected": "db/snappy.json"
+    },
+    {
+      "name": "zstd",
+      "kind": "db",
+      "description": "compressible values, zstd block compression, some vlog values",
+      "path": "db/zstd",
+      "expected": "db/zstd.json"
+    },
+    {
+      "name": "encrypted",
+      "kind": "db",
+      "description": "AES-256 encryption at rest (tables, vlog, WAL, key registry)",
+      "path": "db/encrypted",
+      "expected": "db/encrypted.json"
+    },
+    {
+      "name": "encrypted-zstd",
+      "kind": "db",
+      "description": "encryption combined with zstd compression",
+      "path": "db/encrypted-zstd",
+      "expected": "db/encrypted-zstd.json"
+    },
+    {
+      "name": "managed",
+      "kind": "db",
+      "description": "managed mode with explicit commit timestamps 10,20,...,50",
+      "path": "db/managed",
+      "expected": "db/managed.json"
+    },
+    {
+      "name": "levels",
+      "kind": "db",
+      "description": "data compacted below L0, then overwritten and deleted in L0",
+      "path": "db/levels",
+      "expected": "db/levels.json"
+    },
+    {
+      "name": "crash-wal",
+      "kind": "db",
+      "description": "directory copied from an open DB: unflushed memtable WAL and untruncated vlog",
+      "path": "db/crash-wal",
+      "expected": "db/crash-wal.json"
+    },
+    {
+      "name": "plain",
+      "kind": "sst",
+      "description": "no compression, 4 KiB blocks",
+      "path": "sst/plain/000001.sst",
+      "expected": "sst/plain.json"
+    },
+    {
+      "name": "small-blocks",
+      "kind": "sst",
+      "description": "no compression, 256-byte blocks (many blocks)",
+      "path": "sst/small-blocks/000001.sst",
+      "expected": "sst/small-blocks.json"
+    },
+    {
+      "name": "snappy",
+      "kind": "sst",
+      "description": "snappy-compressed blocks",
+      "path": "sst/snappy/000001.sst",
+      "expected": "sst/snappy.json"
+    },
+    {
+      "name": "zstd",
+      "kind": "sst",
+      "description": "zstd-compressed blocks",
+      "path": "sst/zstd/000001.sst",
+      "expected": "sst/zstd.json"
+    },
+    {
+      "name": "encrypted",
+      "kind": "sst",
+      "description": "AES-encrypted blocks and index",
+      "path": "sst/encrypted/000001.sst",
+      "expected": "sst/encrypted.json"
+    },
+    {
+      "name": "encrypted-zstd",
+      "kind": "sst",
+      "description": "zstd compression then AES encryption",
+      "path": "sst/encrypted-zstd/000001.sst",
+      "expected": "sst/encrypted-zstd.json"
+    }
+  ]
+}

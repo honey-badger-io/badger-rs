@@ -1,0 +1,16 @@
+[package]
+name = "badger"
+description = "A Rust port of the Badger key-value store, on-disk compatible with Go Badger v4.9.6"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+badger-fixtures.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # rustup picks up rust-toolchain.toml automatically.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  fixtures:
+    name: Go fixture generator
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: compat/go-fixtures/go.mod
+          cache-dependency-path: compat/go-fixtures/go.sum
+      - name: Vet
+        working-directory: compat/go-fixtures
+        run: go vet ./...
+      - name: Generate fresh fixtures
+        working-directory: compat/go-fixtures
+        run: go run . gen "$RUNNER_TEMP/fixtures"
+      - name: Rust can read freshly generated fixtures
+        run: cargo test --workspace
+        env:
+          BADGER_FIXTURES: ${{ runner.temp }}/fixtures
+      - name: Committed fixtures still verify against Go Badger
+        working-directory: compat/go-fixtures
+        run: |
+          go build -o go-fixtures .
+          for json in ../fixtures/db/*.json; do
+            name=$(basename "$json" .json)
+            [ "$name" = crash-wal ] && continue  # cannot be opened read-only
+            ./go-fixtures verify "../fixtures/db/$name" "$json"
+          done
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --component miri --profile minimal
+      - run: cargo +nightly miri setup
+      # Unit tests only; fixture-reading integration tests are too slow under Miri.
+      - run: cargo +nightly miri test -p badger --lib
