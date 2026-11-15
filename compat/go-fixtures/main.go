@@ -2,6 +2,7 @@
 // Badger, using the real Go implementation (github.com/dgraph-io/badger/v4 v4.9.6).
 //
 //	go-fixtures gen <out-dir>                 regenerate every fixture into <out-dir>
+//	go-fixtures golden <out-dir>              write deterministic golden values (phase1.json)
 //	go-fixtures dump <db-dir> [options.json]  print a DB's contents as fixture JSON
 //	go-fixtures verify <db-dir> <expected.json>
 //	                                          open <db-dir> with Go Badger (read-only)
@@ -18,6 +19,7 @@ import (
 
 const usage = `usage:
   go-fixtures gen <out-dir>
+  go-fixtures golden <out-dir>
   go-fixtures dump <db-dir> [expected-or-options.json]
   go-fixtures verify <db-dir> <expected.json>
 `
@@ -40,6 +42,11 @@ func run(args []string) error {
 			return fmt.Errorf("gen takes exactly one argument\n%s", usage)
 		}
 		return generate(rest[0])
+	case "golden":
+		if len(rest) != 1 {
+			return fmt.Errorf("golden takes exactly one argument\n%s", usage)
+		}
+		return goldenCmd(rest[0])
 	case "dump":
 		if len(rest) < 1 || len(rest) > 2 {
 			return fmt.Errorf("dump takes one or two arguments\n%s", usage)

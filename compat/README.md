@@ -6,6 +6,7 @@ on-disk fixtures and to check databases written by the Rust port.
 
 ```sh
 make fixtures                                # regenerate compat/fixtures
+make golden                                  # regenerate compat/golden/phase1.json
 make verify DB=/path/to/db EXPECTED=x.json   # Go opens DB read-only and compares
 cd go-fixtures && go run . dump <db-dir> [expected.json]   # print contents as JSON
 ```
@@ -13,6 +14,16 @@ cd go-fixtures && go run . dump <db-dir> [expected.json]   # print contents as J
 The Rust side reads them through the `badger-fixtures` crate
 (`crates/badger-fixtures`). Set `BADGER_FIXTURES=<dir>` to point the tests at
 another fixtures directory.
+
+## Golden values
+
+`golden/phase1.json` (written by `go-fixtures golden`) records exact outputs of
+Go Badger's building blocks: bloom hash and filters, bits-per-key, CRC32C and
+XXHash64, AES-CTR, ValueStruct and varint encodings, key ordering, protobuf
+encodings of fixed messages, and a TableIndex flatbuffer built the way
+`table.Builder` builds it. `crates/badger/tests/golden_phase1.rs` checks the Rust
+port against it byte for byte. Unlike the fixtures, it is fully deterministic;
+CI regenerates it and fails on any difference.
 
 ## Regenerating
 

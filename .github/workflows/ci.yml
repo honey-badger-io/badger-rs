@@ -35,6 +35,11 @@ jobs:
       - name: Vet
         working-directory: compat/go-fixtures
         run: go vet ./...
+      - name: Golden values are reproducible
+        working-directory: compat/go-fixtures
+        run: |
+          go run . golden ../golden
+          git diff --exit-code ../golden
       - name: Generate fresh fixtures
         working-directory: compat/go-fixtures
         run: go run . gen "$RUNNER_TEMP/fixtures"
@@ -60,4 +65,7 @@ jobs:
       - run: rustup toolchain install nightly --component miri --profile minimal
       - run: cargo +nightly miri setup
       # Unit tests only; fixture-reading integration tests are too slow under Miri.
+      # Isolation is off so tests may read the clock and OS randomness.
       - run: cargo +nightly miri test -p badger --lib
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation

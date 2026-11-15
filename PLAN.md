@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 0 done (2026-11-15). Next: Phase 1.
+**Status:** Phase 1 done (2026-11-15). Next: Phase 2.
 
 ## Decisions
 
@@ -99,7 +99,29 @@ Details of the fixtures: `compat/README.md`. What Phase 0 taught us:
 - `compat/go-fixtures verify <dir>`: Go opens a DB written by Rust and checks it against the JSON dump.
 - **Done when:** `cargo test` runs green on an empty crate and the fixtures generate.
 
-### Phase 1: foundations (`y/`, `trie/`, `pb/`, `fb/`, `options.go`, `errors.go`)
+### Phase 1: foundations (`y/`, `trie/`, `pb/`, `fb/`, `options.go`, `errors.go`) (done)
+Result: `crates/badger/src/{util,trie,pb,fb,options,error,structs}`. Go's tests for
+`y/` and `trie/` are ported (except PageBuffer and the allocator tests: neither type
+is used outside `y`). `tests/golden_phase1.rs` matches Go byte for byte via
+`compat/golden/phase1.json`, including a TableIndex built by Rust's flatbuffers
+builder. `tests/sst_index.rs` decodes the index of every SST fixture.
+
+Deviations and findings:
+- `protoc`/`flatc` are not needed: the prost structs and the flatbuffers
+  accessors/builders are written by hand, and the golden tests check them.
+- `WaterMark` uses a mutex and condvar instead of a goroutine and channel. Beginning
+  an index below `done_until` panics, as in Go, so begins must be ordered (the
+  oracle does this under its lock).
+- `ValueStruct<'a>` borrows its value; `Entry` owns its key and value.
+- `ValuePointer` is encoded little-endian (Go copies the struct's memory).
+- Go's `onDiskSize` in the table index includes the vlog bytes referenced by value
+  pointers, plus the *unencrypted* index length.
+- `y.Throttle`, `z.Closer`, compression helpers and options validation were moved
+  to the phases that first use them (2–4). The `Logger` option was dropped in
+  favour of the `log` facade.
+- Under Miri, tests that use AES or CRC32C hardware instructions are skipped
+  (Miri cannot execute them), and Miri runs with isolation disabled.
+
 - Key/timestamp encoding (`KeyWithTs`, `ParseTs`, `ParseKey`, `CompareKeys`, `SameKey`).
 - `ValueStruct` encoding, varints, `header` for vlog/WAL entries (`structs.go`).
 - Checksums (CRC32C, xxhash64) and `pb::Checksum` verification.
