@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 1 done (2026-11-15). Next: Phase 2.
+**Status:** Phase 2 done (2026-11-15). Next: Phase 3.
 
 ## Decisions
 
@@ -133,7 +133,29 @@ Deviations and findings:
 - `Options` builder with the same defaults as Go `DefaultOptions`.
 - **Done when:** Go unit tests for `y/` and `trie/` are ported, and bloom/checksum outputs match Go bit for bit (golden values exported from Go).
 
-### Phase 2: tables (`table/`)
+### Phase 2: tables (`table/`) (done)
+Result: `crates/badger/src/table/` (reader, block and table iterators, concat and
+merge iterators, builder, caches) and `util/{compression,iterator}.rs`. Go's
+table, builder and merge-iterator tests are ported (`table/tests.rs`).
+`tests/table_compat.rs` covers the three "done when" points below. For the third,
+`go-fixtures verify-sst` checks the Rust-built tables (CI and `make compat`).
+
+Deviations and findings:
+- A table's compression type is not stored in the file; the reader is told
+  (the DB gets it from the manifest). Opening with the wrong one fails.
+- Entry headers and block entry offsets are little-endian (Go copies memory);
+  entry counts, checksum and index lengths are big-endian.
+- Tables live in `Arc`; `Table::delete_on_drop` replaces Go's refcount-to-zero
+  deletion. Table bytes are `bytes::Bytes` over the mmap, so blocks and the index
+  are zero-copy slices.
+- Blocks are compressed/encrypted synchronously (Go uses a goroutine pool).
+- `quick_cache` replaces ristretto for the block and index caches.
+- Without an index cache, an encrypted table keeps its decrypted index in memory.
+- A fresh table iterator is invalid until positioned (Go's reports valid).
+  Corrupt blocks stop iteration with an error (`TableIterator::error`) instead
+  of being treated as the end of the block.
+- MSRV raised to 1.88 for `let` chains.
+
 - Reading over `memmap2`: footer → index (flatbuffers) → block offsets → blocks; decompression and decryption; checksum verification modes.
 - Block iterator (entry diff-encoded keys against the base key), table iterator (seek, seek-for-prev, reversed), `ConcatIterator`, `MergeIterator`.
 - Block cache and index cache.

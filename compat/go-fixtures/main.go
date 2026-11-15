@@ -7,6 +7,8 @@
 //	go-fixtures verify <db-dir> <expected.json>
 //	                                          open <db-dir> with Go Badger (read-only)
 //	                                          and compare it to <expected.json>
+//	go-fixtures verify-sst <file.sst> <expected.json>
+//	                                          open a table with Go Badger and compare it
 //
 // The JSON formats are documented in ../README.md and mirrored by the
 // `badger-fixtures` Rust crate.
@@ -22,6 +24,7 @@ const usage = `usage:
   go-fixtures golden <out-dir>
   go-fixtures dump <db-dir> [expected-or-options.json]
   go-fixtures verify <db-dir> <expected.json>
+  go-fixtures verify-sst <file.sst> <expected.json>
 `
 
 func main() {
@@ -57,6 +60,11 @@ func run(args []string) error {
 			return fmt.Errorf("verify takes exactly two arguments\n%s", usage)
 		}
 		return verifyCmd(rest[0], rest[1])
+	case "verify-sst":
+		if len(rest) != 2 {
+			return fmt.Errorf("verify-sst takes exactly two arguments\n%s", usage)
+		}
+		return verifySSTCmd(rest[0], rest[1])
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
 	}

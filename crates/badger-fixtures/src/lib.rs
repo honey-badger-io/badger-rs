@@ -232,6 +232,15 @@ impl DbExpected {
     }
 }
 
+impl SstExpected {
+    /// Writes this file so `go-fixtures verify-sst <sst> <path>` can check a
+    /// table written by Rust.
+    pub fn write(&self, path: &Path) -> Result<()> {
+        fs::write(path, serde_json::to_vec_pretty(self)?)?;
+        Ok(())
+    }
+}
+
 /// Encodes a user key and version the way Go Badger's `y.KeyWithTs` does: the
 /// key followed by `u64::MAX - version` in big-endian, so newer versions sort first.
 pub fn key_with_ts(key: &[u8], version: u64) -> Vec<u8> {

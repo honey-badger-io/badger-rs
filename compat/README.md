@@ -8,6 +8,7 @@ on-disk fixtures and to check databases written by the Rust port.
 make fixtures                                # regenerate compat/fixtures
 make golden                                  # regenerate compat/golden/phase1.json
 make verify DB=/path/to/db EXPECTED=x.json   # Go opens DB read-only and compares
+make compat                                  # Rust builds tables; Go checks them (verify-sst)
 cd go-fixtures && go run . dump <db-dir> [expected.json]   # print contents as JSON
 ```
 

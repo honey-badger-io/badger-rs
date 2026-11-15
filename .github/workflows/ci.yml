@@ -47,6 +47,14 @@ jobs:
         run: cargo test --workspace
         env:
           BADGER_FIXTURES: ${{ runner.temp }}/fixtures
+      - name: Go reads tables built by Rust
+        run: |
+          BADGER_COMPAT_OUT="$RUNNER_TEMP/compat" cargo test -p badger --test table_compat builds_every
+          cd compat/go-fixtures && go build -o go-fixtures .
+          for json in "$RUNNER_TEMP"/compat/sst/*.json; do
+            name=$(basename "$json" .json)
+            ./go-fixtures verify-sst "$RUNNER_TEMP/compat/sst/$name/000001.sst" "$json"
+          done
       - name: Committed fixtures still verify against Go Badger
         working-directory: compat/go-fixtures
         run: |

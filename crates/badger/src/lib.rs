@@ -17,12 +17,14 @@
 //! | `options.go`, `options/` | [`options`] |
 //! | `errors.go` | [`error`] |
 //! | `structs.go` | [`structs`] |
+//! | `table` | [`table`] |
 
 pub mod error;
 pub mod fb;
 pub mod options;
 pub mod pb;
 pub mod structs;
+pub mod table;
 pub mod trie;
 pub mod util;
 

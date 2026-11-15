@@ -9,19 +9,25 @@ publish.workspace = true
 
 [dependencies]
 aes = "0.9.2"
+bytes = "1.12.1"
 crc32c = "0.6.9"
 ctr = "0.10.1"
 flatbuffers = "=25.2.10"  # same version as Go Badger v4.9.6
 getrandom = "0.4.3"
+memmap2 = "0.9.12"
 prost = "0.14.6"
+quick_cache = "0.7.0"
+snap = "1.1.2"
 thiserror = "2.0.21"
 xxhash-rust = { version = "0.8.19", features = ["xxh64"] }
+zstd = "0.14.4"
 
 [dev-dependencies]
 badger-fixtures.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

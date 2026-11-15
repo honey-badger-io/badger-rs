@@ -13,6 +13,7 @@ import (
 	"github.com/dgraph-io/badger/v4/table"
 	"github.com/dgraph-io/badger/v4/y"
 	"github.com/dgraph-io/ristretto/v2"
+	"github.com/dgraph-io/ristretto/v2/z"
 )
 
 // Value meta bits, copied from badger's structs.go (unexported there).
@@ -171,5 +172,63 @@ func checkTable(tbl *table.Table, want []SSTEntry) error {
 	if i != len(want) {
 		return fmt.Errorf("table has %d entries, want %d", i, len(want))
 	}
+	return nil
+}
+
+// verifySSTCmd opens a table (e.g. one written by the Rust port) with Go
+// Badger and compares it with an SST expected-contents file.
+func verifySSTCmd(sstPath, expectedPath string) error {
+	var exp SSTExpected
+	if err := readJSON(expectedPath, &exp); err != nil {
+		return err
+	}
+	c, err := compressionFromName(exp.Compression)
+	if err != nil {
+		return err
+	}
+	opts := table.Options{
+		TableSize:          exp.TableSize,
+		BlockSize:          exp.BlockSize,
+		BloomFalsePositive: exp.BloomFalsePositive,
+		Compression:        c,
+		ChkMode:            options.OnTableAndBlockRead,
+	}
+	if exp.DataKey != nil {
+		opts.DataKey = &pb.DataKey{
+			KeyId: exp.DataKey.KeyID, Data: exp.DataKey.Data, Iv: exp.DataKey.IV, CreatedAt: exp.DataKey.CreatedAt,
+		}
+		cache, err := ristretto.NewCache(&ristretto.Config[uint64, *fb.TableIndex]{
+			NumCounters: 1000, MaxCost: 1 << 20, BufferItems: 64,
+		})
+		if err != nil {
+			return err
+		}
+		defer cache.Close()
+		opts.IndexCache = cache
+	}
+	mf, err := z.OpenMmapFile(sstPath, os.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", sstPath, err)
+	}
+	tbl, err := table.OpenTable(mf, opts)
+	if err != nil {
+		return fmt.Errorf("opening table %s: %w", sstPath, err)
+	}
+	defer tbl.MmapFile.Close(-1)
+
+	if err := checkTable(tbl, exp.Entries); err != nil {
+		return fmt.Errorf("%s: %w", sstPath, err)
+	}
+	switch {
+	case !bytes.Equal(tbl.Smallest(), exp.Smallest):
+		return fmt.Errorf("%s: smallest key differs", sstPath)
+	case !bytes.Equal(tbl.Biggest(), exp.Biggest):
+		return fmt.Errorf("%s: biggest key differs", sstPath)
+	case tbl.KeyCount() != exp.KeyCount:
+		return fmt.Errorf("%s: key count %d, want %d", sstPath, tbl.KeyCount(), exp.KeyCount)
+	case tbl.MaxVersion() != exp.MaxVersion:
+		return fmt.Errorf("%s: max version %d, want %d", sstPath, tbl.MaxVersion(), exp.MaxVersion)
+	}
+	fmt.Printf("ok: %s matches %s (%d entries)\n", sstPath, expectedPath, len(exp.Entries))
 	return nil
 }

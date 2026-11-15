@@ -12,13 +12,12 @@ pub fn hash(b: &[u8]) -> u32 {
     const M: u32 = 0xc6a4a793;
 
     let mut h = SEED ^ (b.len() as u32).wrapping_mul(M);
-    let mut chunks = b.chunks_exact(4);
-    for c in &mut chunks {
-        h = h.wrapping_add(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    let (chunks, rest) = b.as_chunks::<4>();
+    for c in chunks {
+        h = h.wrapping_add(u32::from_le_bytes(*c));
         h = h.wrapping_mul(M);
         h ^= h >> 16;
     }
-    let rest = chunks.remainder();
     // Go's switch with fallthrough: 3 adds b[2]<<16, then b[1]<<8, then b[0].
     if rest.len() == 3 {
         h = h.wrapping_add((rest[2] as u32) << 16);

@@ -294,6 +294,15 @@ pub fn root_as_table_index(buf: &[u8]) -> Result<TableIndex<'_>, InvalidFlatbuff
     flatbuffers::root::<TableIndex>(buf)
 }
 
+/// Returns the root TableIndex without verifying it.
+///
+/// # Safety
+/// The same bytes must already have passed [`root_as_table_index`].
+pub unsafe fn root_as_table_index_unchecked(buf: &[u8]) -> TableIndex<'_> {
+    // SAFETY: the caller guarantees `buf` is a verified TableIndex buffer.
+    unsafe { flatbuffers::root_unchecked::<TableIndex>(buf) }
+}
+
 /// Overwrites `on_disk_size` in a finished TableIndex buffer, like Go's
 /// `MutateOnDiskSize`. Returns false if the field is absent (it was written
 /// as the default 0), in which case nothing changes.

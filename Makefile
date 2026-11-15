@@ -1,6 +1,6 @@
 GO_FIXTURES := compat/go-fixtures
 
-.PHONY: check fmt clippy test fixtures golden miri verify go-fixtures
+.PHONY: check fmt clippy test fixtures golden miri compat verify go-fixtures
 
 ## check: everything CI runs for Rust (format, lint, tests)
 check: fmt clippy test
@@ -26,6 +26,16 @@ golden:
 ## miri: run unit tests under Miri (needs a nightly toolchain with miri)
 miri:
 	MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p badger --lib
+
+## compat: build tables with Rust and check them with Go Badger
+COMPAT_OUT := target/compat
+compat: go-fixtures
+	rm -rf $(COMPAT_OUT)
+	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test table_compat builds_every
+	for json in $(COMPAT_OUT)/sst/*.json; do \
+		name=$$(basename $$json .json); \
+		$(GO_FIXTURES)/go-fixtures verify-sst $(COMPAT_OUT)/sst/$$name/000001.sst $$json || exit 1; \
+	done
 
 ## verify: check a DB with Go Badger, e.g. make verify DB=/tmp/db EXPECTED=/tmp/db.json
 verify: go-fixtures
