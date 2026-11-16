@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 3 done (2026-11-16). Next: Phase 4.
+**Status:** Phase 4 done (2026-11-16). Next: Phase 5.
 
 ## Decisions
 
@@ -205,7 +205,36 @@ Deviations and findings:
 - Memtable = skiplist + WAL (`logFile`): mmapped, preallocated, encrypted entries, truncation on replay.
 - **Done when:** concurrent insert/get tests pass under `loom` (small model) and `miri`, and Go `.mem` fixtures replay correctly.
 
-### Phase 4: open a DB read-only (`manifest.go`, `levels.go`, `level_handler.go`, `db.go` open path)
+### Phase 4: open a DB read-only (`manifest.go`, `levels.go`, `level_handler.go`, `db.go` open path) (done)
+Result: `crates/badger/src/{db,txn,iterator,oracle,levels,vlog,manifest,dir_lock}.rs`.
+`DB::open` / `DB::open_managed` (read-only), `db.view`, `Txn::get`,
+`Txn::iter` / `key_iter` (forward, reverse, all versions, prefix, seek,
+since_ts), `Item::value` / `value_copy`. `tests/db_compat.rs` opens every
+readable Go fixture DB and matches its JSON dump entry for entry, and also
+checks gets, latest-version iteration both ways, prefix/seek/key iterators,
+managed reads at older timestamps, the shared directory lock and a wrong
+encryption key. Go's manifest and pick-tables tests are ported.
+
+Deviations and findings:
+- Only read-only opens work; anything else is `InvalidOptions` until Phase 5.
+  `ValueLog::open` likewise only opens existing files read-only.
+- No value prefetching: `prefetch_values` is ignored and values are read when
+  `Item::value` is called (Phase 7). Without prefetch, Go's iterator buffers
+  at most one item ahead; reading lazily gives the same results.
+- Items borrow the DB (`Item<'db>`), iterators borrow their transaction, and a
+  transaction ends when dropped, so Go's "unclosed iterator" panic cannot
+  happen. Values are passed to a closure (`Item::value(|v| ...)`), straight
+  from the mapped vlog file when unencrypted.
+- `IteratorOptions` has only public fields; Go's private `prefixIsKey` is a
+  flag on the iterator, set by `Txn::key_iter`.
+- Read-only opens never delete table files missing from the manifest (Go's
+  `revertToManifest` deletes them even in read-only mode).
+- Tables are opened one by one (Go uses three goroutines).
+- The directory lock uses `std`'s `File::try_lock{,_shared}` (flock on Unix),
+  so the MSRV is now 1.89. No lock on non-Unix platforms yet.
+- `checkAndSetOptions` is `Options::check_and_set`; a missing block cache with
+  compression or encryption is an error instead of a panic.
+- The crate now logs through the `log` facade.
 - Manifest replay (change sets, rewrite), directory lock (KEYREGISTRY was done in Phase 3).
 - Level handlers, table loading, point `get` across memtables → L0 → Ln with version selection.
 - Read-only `Txn` + `Iterator` (no prefetch yet) and the vlog read path (value pointers).

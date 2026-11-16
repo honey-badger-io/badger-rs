@@ -241,14 +241,9 @@ impl Drop for MemTable {
             file.close(None)
         };
         if let Err(e) = res {
-            log_error(&format!("while closing WAL {}: {e}", path.display()));
+            log::error!("while closing WAL {}: {e}", path.display());
         }
     }
-}
-
-// TODO(phase 5): switch to the `log` facade once the crate depends on it.
-fn log_error(msg: &str) {
-    eprintln!("badger: {msg}");
 }
 
 /// The value of a replayed WAL entry.

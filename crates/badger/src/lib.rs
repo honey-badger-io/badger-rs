@@ -21,23 +21,42 @@
 //! | `skl` | [`skl`] |
 //! | `memtable.go` | [`memtable`], [`log_file`] |
 //! | `key_registry.go` | [`key_registry`] |
+//! | `manifest.go` | [`manifest`] |
+//! | `levels.go`, `level_handler.go` | `levels` (internal) |
+//! | `value.go` (value log) | [`vlog`] |
+//! | `db.go`, `managed_db.go` | [`db`] |
+//! | `txn.go` | [`txn`], `oracle` (internal) |
+//! | `iterator.go` | [`iterator`] |
+//! | `dir_unix.go` | [`dir_lock`] |
 
+pub mod db;
+pub mod dir_lock;
 pub mod error;
 pub mod fb;
+pub mod iterator;
 pub mod key_registry;
+mod levels;
 pub mod log_file;
+pub mod manifest;
 pub mod memtable;
 pub mod options;
+mod oracle;
 pub mod pb;
 pub mod skl;
 pub mod structs;
 pub mod table;
 pub mod trie;
+pub mod txn;
 pub mod util;
+pub mod vlog;
 
+pub use db::DB;
 pub use error::{Error, Result};
+pub use iterator::{Item, Iterator, IteratorOptions};
+pub use levels::TableInfo;
 pub use options::Options;
 pub use structs::Entry;
+pub use txn::Txn;
 
 /// The Go Badger release whose on-disk format this crate reads and writes.
 pub const GO_BADGER_VERSION: &str = "v4.9.6";

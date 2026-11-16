@@ -14,6 +14,7 @@ crc32c = "0.6.9"
 ctr = "0.10.1"
 flatbuffers = "=25.2.10"  # same version as Go Badger v4.9.6
 getrandom = "0.4.3"
+log = "0.4"
 memmap2 = "0.9.12"
 prost = "0.14.6"
 quick_cache = "0.7.0"

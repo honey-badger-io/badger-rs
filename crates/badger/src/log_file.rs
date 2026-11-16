@@ -149,7 +149,7 @@ impl LogFile {
         iv
     }
 
-    fn decrypt_kv(&self, buf: &[u8], offset: u32) -> Result<Vec<u8>> {
+    pub(crate) fn decrypt_kv(&self, buf: &[u8], offset: u32) -> Result<Vec<u8>> {
         let dk = self.data_key.as_ref().expect("encryption enabled");
         xor_block_alloc(buf, &dk.data, &self.iv(offset))
     }

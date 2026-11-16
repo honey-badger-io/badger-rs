@@ -4,7 +4,7 @@ A learning port of [Badger](https://github.com/dgraph-io/badger) v4.9.6 to Rust.
 It aims to stay on-disk compatible with Go Badger: each implementation can open
 databases written by the other.
 
-See [PLAN.md](PLAN.md) for the roadmap. Current status: **Phase 3 (skiplist and memtable) done**; next is Phase 4 (opening a DB read-only).
+See [PLAN.md](PLAN.md) for the roadmap. Current status: **Phase 4 (opening a DB read-only) done**: Rust reads every Go fixture DB. Next is Phase 5 (the write path).
 
 ## Layout
 

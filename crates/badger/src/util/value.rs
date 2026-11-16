@@ -74,6 +74,29 @@ impl<'a> ValueStruct<'a> {
     }
 }
 
+/// An owned copy of a [`ValueStruct`], for values that must outlive the
+/// memtable or table they were read from (Go copies with `ValueCopy`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnedValueStruct {
+    pub meta: u8,
+    pub user_meta: u8,
+    pub expires_at: u64,
+    pub value: Vec<u8>,
+    pub version: u64,
+}
+
+impl From<ValueStruct<'_>> for OwnedValueStruct {
+    fn from(v: ValueStruct<'_>) -> Self {
+        OwnedValueStruct {
+            meta: v.meta,
+            user_meta: v.user_meta,
+            expires_at: v.expires_at,
+            value: v.value.to_vec(),
+            version: v.version,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,6 +40,7 @@ dependencies = [
  "flatbuffers",
  "getrandom",
  "hex",
+ "log",
  "loom",
  "memmap2",
  "prost",

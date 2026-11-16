@@ -278,6 +278,63 @@ with_methods! {
 }
 
 impl Options {
+    /// Checks option values and combinations before opening a DB, and turns
+    /// off settings that do not apply (Go's `checkAndSetOptions` in `db.go`).
+    pub(crate) fn check_and_set(&mut self) -> Result<()> {
+        let invalid = |msg: String| Err(Error::InvalidOptions(msg));
+        // Zero compactors disables compaction; one would leave all data in L2.
+        if self.num_compactors == 1 {
+            return invalid("Cannot have 1 compactor. Need at least 2".into());
+        }
+        let has_dir = |p: &PathBuf| !p.as_os_str().is_empty();
+        if self.in_memory && (has_dir(&self.dir) || has_dir(&self.value_dir)) {
+            return invalid("Cannot use badger in Disk-less mode with Dir or ValueDir set".into());
+        }
+        if !(0.0..=1.0).contains(&self.vlog_percentile) {
+            return invalid("vlogPercentile must be within range of 0.0-1.0".into());
+        }
+        if self.value_threshold > MAX_VALUE_THRESHOLD {
+            return invalid(format!(
+                "Invalid ValueThreshold, must be less or equal to {MAX_VALUE_THRESHOLD}"
+            ));
+        }
+        // Transactions are batched by max_batch_size, so bigger values could
+        // never be written.
+        if self.value_threshold > self.max_batch_size() {
+            return invalid(format!(
+                "Valuethreshold {} greater than max batch size of {}. Either reduce \
+                 opt.ValueThreshold or increase opt.BaseTableSize.",
+                self.value_threshold,
+                self.max_batch_size()
+            ));
+        }
+        // Offsets in a value log file are u32, and files are mapped at twice
+        // their size.
+        if !(1 << 20..2 << 30).contains(&self.value_log_file_size) {
+            return Err(Error::ValueLogSize);
+        }
+        if self.read_only {
+            self.compact_l0_on_close = false;
+        }
+        let need_cache =
+            self.compression != CompressionType::None || !self.encryption_key.is_empty();
+        if need_cache && self.block_cache_size == 0 {
+            // Go panics here.
+            return invalid(
+                "BlockCacheSize should be set since compression/encryption are enabled".into(),
+            );
+        }
+        if self.num_level_zero_tables_stall <= self.num_level_zero_tables {
+            return invalid("NumLevelZeroTablesStall must be above NumLevelZeroTables".into());
+        }
+        if self.in_memory {
+            self.sync_writes = false;
+            // Everything stays in the LSM tree.
+            self.value_threshold = i32::MAX as u64;
+        }
+        Ok(())
+    }
+
     pub fn with_dir(mut self, dir: impl AsRef<Path>) -> Self {
         self.dir = dir.as_ref().to_path_buf();
         self
@@ -292,6 +349,47 @@ impl Options {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_and_set() {
+        assert!(Options::new("/d").check_and_set().is_ok());
+        assert!(
+            Options::new("/d")
+                .with_num_compactors(1)
+                .check_and_set()
+                .is_err()
+        );
+        assert!(
+            Options::new("/d")
+                .with_in_memory(true)
+                .check_and_set()
+                .is_err()
+        );
+        let mut mem = Options::new("").with_in_memory(true);
+        mem.check_and_set().unwrap();
+        assert_eq!(mem.value_threshold, i32::MAX as u64);
+        assert!(matches!(
+            Options::new("/d")
+                .with_value_log_file_size(1 << 19)
+                .check_and_set(),
+            Err(Error::ValueLogSize)
+        ));
+        let small = Options::new("/d").with_mem_table_size(1 << 20);
+        assert!(
+            small
+                .clone()
+                .with_value_threshold(1 << 18)
+                .check_and_set()
+                .is_err()
+        );
+        assert!(small.with_value_threshold(1 << 10).check_and_set().is_ok());
+        assert!(
+            Options::new("/d")
+                .with_block_cache_size(0)
+                .check_and_set()
+                .is_err()
+        );
+    }
 
     #[test]
     fn defaults_match_go() {
