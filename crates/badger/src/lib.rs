@@ -24,7 +24,7 @@
 //! | `manifest.go` | [`manifest`] |
 //! | `levels.go`, `level_handler.go` | `levels` (internal) |
 //! | `value.go` (value log) | [`vlog`] |
-//! | `db.go`, `managed_db.go` | [`db`] |
+//! | `db.go`, `managed_db.go` | [`db`], `write` (internal: writer and flush threads) |
 //! | `txn.go` | [`txn`], `oracle` (internal) |
 //! | `iterator.go` | [`iterator`] |
 //! | `dir_unix.go` | [`dir_lock`] |
@@ -49,6 +49,7 @@ pub mod trie;
 pub mod txn;
 pub mod util;
 pub mod vlog;
+mod write;
 
 pub use db::DB;
 pub use error::{Error, Result};

@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 4 done (2026-11-16). Next: Phase 5.
+**Status:** Phase 5 done (2026-11-16). Next: Phase 6.
 
 ## Decisions
 
@@ -240,7 +240,40 @@ Deviations and findings:
 - Read-only `Txn` + `Iterator` (no prefetch yet) and the vlog read path (value pointers).
 - **Done when (the main milestone):** Rust opens every Go fixture DB read-only and matches its JSON dump.
 
-### Phase 5: write path (`db.go` write loop, `txn.go`, `value.go` write side, `memtable.go` flush)
+### Phase 5: write path (`db.go` write loop, `txn.go`, `value.go` write side, `memtable.go` flush) (done)
+Result: `crates/badger/src/{write,oracle,txn,vlog,db}.rs`. `DB::open` now
+opens read-write and in-memory DBs; `db.update`, `Txn::set` / `set_entry` /
+`delete` / `commit`, managed `commit_at`, `db.sync`, `db.close`. Go's
+`txn_test.go` and the write-path tests of `db_test.go` are ported
+(`src/db/tests.rs`). `tests/write_compat.rs` writes eight DBs (inline and
+vlog values, rotated vlog files, versions/deletes/expiry, 12 overlapping L0
+tables, zstd, AES with and without snappy, managed) and `go-fixtures verify`
+accepts every one (`make compat`, CI). `tests/crash.rs` SIGKILLs a writer
+child at random points and checks that acknowledged transactions survive,
+transactions are all-or-nothing and commits have no gaps (60 rounds pass
+locally; skipping WAL replay makes it fail).
+
+Deviations and findings:
+- Threads: one writer (batches up to 3000 requests, then writes them on the
+  same thread; Go overlaps collecting and writing) and one memtable flusher.
+  Closing drops the write channel's sender behind an `RwLock` gate, so no
+  request can be queued after the writer drains the channel.
+- No L0 write stall yet: without compaction (Phase 6) it would block writes
+  forever, so L0 just grows.
+- Each vlog file has an `RwLock`; the writer takes it for every append, and
+  readers hold it while using the value. The value threshold is fixed
+  (`vlog_percentile` / dynamic threshold not ported). No DISCARD file yet
+  (it belongs to GC, Phase 6); Go creates it when it opens the DB read-write.
+- Transactions: `commit` consumes the transaction, dropping discards it,
+  and writes take `&mut Txn` (so no writes while an iterator is alive). Go's
+  `CommitWith` (async callback) is not ported; commit from another thread
+  instead. Conflict fingerprints use xxhash64 instead of Go's runtime hash
+  (they are never stored).
+- An error in a write batch is reported to every request in it as
+  `Error::Shared`.
+- A memtable WAL is deleted after its L0 table is in the manifest; an empty
+  memtable's WAL is deleted at close, as in Go.
+
 - Write channel → batching → vlog write (for large values) → WAL → skiplist.
 - Oracle: read/commit timestamps, conflict detection via key fingerprints, `WaterMark`s for read and txn marks.
 - `Txn` (update, set, delete, entries with TTL/meta/user meta), `db.view`/`db.update`.

@@ -4,7 +4,7 @@ A learning port of [Badger](https://github.com/dgraph-io/badger) v4.9.6 to Rust.
 It aims to stay on-disk compatible with Go Badger: each implementation can open
 databases written by the other.
 
-See [PLAN.md](PLAN.md) for the roadmap. Current status: **Phase 4 (opening a DB read-only) done**: Rust reads every Go fixture DB. Next is Phase 5 (the write path).
+See [PLAN.md](PLAN.md) for the roadmap. Current status: **Phase 5 (the write path) done**: Rust reads every Go fixture DB, and Go reads DBs written by Rust. Next is Phase 6 (compaction and value log GC).
 
 ## Layout
 
@@ -25,7 +25,7 @@ make fixtures   # regenerate compat/fixtures (needs Go >= 1.24)
 make golden     # regenerate compat/golden
 make miri       # unit tests under Miri (nightly)
 make loom       # skiplist interleavings under loom
-make compat     # build tables with Rust, verify them with Go
+make compat     # build tables and DBs with Rust, verify them with Go
 ```
 
 ## License

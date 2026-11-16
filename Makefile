@@ -32,14 +32,19 @@ miri:
 loom:
 	RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p badger --lib --release skl::loom_tests
 
-## compat: build tables with Rust and check them with Go Badger
+## compat: build tables and DBs with Rust and check them with Go Badger
 COMPAT_OUT := target/compat
 compat: go-fixtures
 	rm -rf $(COMPAT_OUT)
 	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test table_compat builds_every
+	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test write_compat
 	for json in $(COMPAT_OUT)/sst/*.json; do \
 		name=$$(basename $$json .json); \
 		$(GO_FIXTURES)/go-fixtures verify-sst $(COMPAT_OUT)/sst/$$name/000001.sst $$json || exit 1; \
+	done
+	for json in $(COMPAT_OUT)/db/*.json; do \
+		name=$$(basename $$json .json); \
+		$(GO_FIXTURES)/go-fixtures verify $(COMPAT_OUT)/db/$$name $$json || exit 1; \
 	done
 
 ## verify: check a DB with Go Badger, e.g. make verify DB=/tmp/db EXPECTED=/tmp/db.json

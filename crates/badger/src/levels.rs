@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 use crate::error::{Error, Result, ResultExt};
 use crate::iterator::IteratorOptions;
 use crate::key_registry::KeyRegistry;
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestFile, new_create_change};
 use crate::options::Options;
 use crate::table::{
     BlockCache, ConcatIterator, IndexCache, Table, TableOptions, new_filename, parse_file_id,
@@ -199,8 +199,28 @@ impl LevelsController {
         out
     }
 
+    /// Adds a table flushed from a memtable to L0, recording it in the
+    /// manifest first (Go's `addLevel0Table`).
+    ///
+    /// Go stalls here while L0 holds `num_level_zero_tables_stall` tables,
+    /// until compaction drains it. Compaction arrives in Phase 6, so for now
+    /// L0 just grows.
+    pub fn add_level0_table(&self, t: Arc<Table>, manifest: &ManifestFile) -> Result<()> {
+        // The manifest is updated before the table becomes visible, so a
+        // compaction that later deletes it is recorded after its creation.
+        if !t.is_in_memory() {
+            manifest.add_changes(vec![new_create_change(
+                t.id(),
+                0,
+                t.key_id(),
+                t.compression_type(),
+            )])?;
+        }
+        self.levels[0].tables.write().unwrap().push(t);
+        Ok(())
+    }
+
     /// The id the next new table gets.
-    #[allow(dead_code)] // used by flushes and compaction (Phases 5–6)
     pub fn reserve_file_id(&self) -> u64 {
         self.next_file_id.fetch_add(1, Ordering::Relaxed)
     }

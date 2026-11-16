@@ -11,6 +11,7 @@ publish.workspace = true
 aes = "0.9.2"
 bytes = "1.12.1"
 crc32c = "0.6.9"
+crossbeam-channel = "0.5"
 ctr = "0.10.1"
 flatbuffers = "=25.2.10"  # same version as Go Badger v4.9.6
 getrandom = "0.4.3"

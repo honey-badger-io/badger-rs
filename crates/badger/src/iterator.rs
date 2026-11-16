@@ -7,6 +7,8 @@
 //! (unless `all_versions`) older versions and deleted or expired keys.
 //!
 //! Differences from Go:
+//! - An update transaction's iterator sees its pending writes as they were
+//!   when the iterator was created.
 //! - No value prefetching yet (`prefetch_values` is ignored; values are read
 //!   on demand by [`Item::value`]). It comes with Phase 7.
 //! - `Close` is `Drop`, and the borrow checker replaces Go's "unclosed
@@ -291,7 +293,10 @@ impl<'t> Iterator<'t> {
     pub(crate) fn new(txn: &'t Txn<'t>, opt: IteratorOptions, prefix_is_key: bool) -> Self {
         let db = txn.db();
         let mut iters: Vec<BoxedIter> = Vec::new();
-        // Pending writes of an update transaction come first (Phase 5).
+        // An update transaction's own writes come first, so they win.
+        if let Some(pw) = txn.pending_writes_iter(opt.reverse) {
+            iters.push(Box::new(pw));
+        }
         for mt in db.mem_tables() {
             iters.push(Box::new(mt.skiplist().uni_iter(opt.reverse)));
         }
@@ -312,7 +317,9 @@ impl<'t> Iterator<'t> {
     /// # Panics
     /// If the iterator is not [`valid`](Iterator::valid).
     pub fn item(&self) -> &Item<'t> {
-        self.item.as_ref().expect("iterator is not valid")
+        let item = self.item.as_ref().expect("iterator is not valid");
+        self.txn.add_read_key(&item.key);
+        item
     }
 
     /// Whether the iterator points at an item (within the prefix, if any).
@@ -327,7 +334,7 @@ impl<'t> Iterator<'t> {
 
     /// Whether the iterator is valid and the current key starts with `prefix`.
     pub fn valid_for_prefix(&self, prefix: &[u8]) -> bool {
-        self.valid() && self.item().key.starts_with(prefix)
+        self.valid() && self.item.as_ref().unwrap().key.starts_with(prefix)
     }
 
     /// Moves to the next item.
@@ -422,6 +429,9 @@ impl<'t> Iterator<'t> {
     /// Moves to the first key at or after `key` (at or before it, if
     /// reversed). An empty key means the prefix, or the start.
     pub fn seek(&mut self, key: &[u8]) {
+        if !key.is_empty() {
+            self.txn.add_read_key(key);
+        }
         self.item = None;
         self.last_key.clear();
         let key = if key.is_empty() {

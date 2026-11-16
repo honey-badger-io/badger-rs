@@ -206,6 +206,27 @@ impl LogFile {
         Ok(())
     }
 
+    /// Appends already-encoded bytes at [`LogFile::write_at`], growing the
+    /// file if they do not fit (the value log's write; Go does this inline in
+    /// `valueLog.write`). Returns the offset they were written at.
+    pub fn append(&mut self, buf: &[u8]) -> Result<u32> {
+        let start = self.write_at;
+        let end = start as u64 + buf.len() as u64;
+        if end > u32::MAX as u64 {
+            return Err(Error::corruption(format!(
+                "log file {} would exceed 4 GiB",
+                self.fid
+            )));
+        }
+        if end >= self.mmap.data().len() as u64 {
+            self.truncate(end)?;
+        }
+        self.mmap.data_mut()[start as usize..end as usize].copy_from_slice(buf);
+        self.write_at = end as u32;
+        self.size = end as u32;
+        Ok(start)
+    }
+
     /// Decodes the entry at the start of `buf`, which was read at `offset`.
     /// The CRC is not checked.
     pub fn decode_entry(&self, buf: &[u8], offset: u32) -> Result<Entry> {

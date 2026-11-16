@@ -1,13 +1,23 @@
-//! The database. Port of Go's `db.go` (and `managed_db.go`'s read side).
+//! The database. Port of Go's `db.go` (and `managed_db.go`'s basics).
 //!
-//! So far a DB can only be opened read-only: [`DB::open`] replays the
-//! manifest, the memtable WALs and the value log, and transactions read
-//! through memtables → L0 → Ln. The write path comes in Phase 5.
+//! Opening replays the manifest, the memtable WALs and the value log. Reads
+//! go through memtables → L0 → Ln. Writes are queued to a writer thread
+//! (see [`crate::write`]), which appends to the value log and the memtable;
+//! full memtables are flushed to L0 tables by a flush thread.
+//!
+//! Differences from Go:
+//! - Background work runs on `std` threads; [`DB::close`] (or dropping the
+//!   DB) stops and joins them.
+//! - No compaction, value log GC or L0 write stalls yet (Phase 6), no
+//!   subscriptions (Phase 7).
 
 use std::collections::HashSet;
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::JoinHandle;
+
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::dir_lock::DirLockGuard;
 use crate::error::{Error, Result, ResultExt};
@@ -18,18 +28,26 @@ use crate::manifest::ManifestFile;
 use crate::memtable::{MemTable, open_mem_tables};
 use crate::options::Options;
 use crate::oracle::Oracle;
-use crate::table::{new_block_cache, new_index_cache};
+use crate::structs::Entry;
+use crate::table::{TableOptions, new_block_cache, new_index_cache};
 use crate::txn::Txn;
-use crate::util::OwnedValueStruct;
 use crate::util::keys::parse_ts;
+use crate::util::{OwnedValueStruct, sync_dir};
 use crate::vlog::ValueLog;
+use crate::write::{self, FlushMsg, Request};
 
 /// Key prefix under which banned namespaces are stored.
 pub(crate) const BANNED_NS_KEY: &[u8] = b"!badger!banned";
 
-/// An open database. Shareable between threads (`&DB` is `Send`).
+/// Capacity of the write channel (Go's `kvWriteChCapacity`).
+pub(crate) const WRITE_CH_CAPACITY: usize = 1000;
+
+/// An open database. Share it between threads by reference (`&DB` is
+/// `Send`), or put it in an `Arc`.
 pub struct DB {
     inner: Arc<DbInner>,
+    writer: Option<JoinHandle<()>>,
+    flusher: Option<JoinHandle<()>>,
 }
 
 /// Memtables: the one being written (none in read-only mode) and the
@@ -38,18 +56,27 @@ pub struct DB {
 pub(crate) struct MemTables {
     pub mt: Option<Arc<MemTable>>,
     pub imm: Vec<Arc<MemTable>>,
+    /// Id of the next memtable WAL.
+    pub next_mem_fid: u32,
 }
 
 pub(crate) struct DbInner {
     pub opt: Options,
-    pub mem: RwLock<MemTables>,
+    pub mem: Mutex<MemTables>,
+    /// Signalled when the flush thread removes a memtable from `imm`.
+    pub flush_cond: Condvar,
     pub lc: LevelsController,
     pub vlog: ValueLog,
     pub orc: Oracle,
-    #[allow(dead_code)] // flushes and compactions add changes (Phases 5–6)
     pub manifest: ManifestFile,
-    #[allow(dead_code)] // new files get keys from it (Phase 5)
     pub registry: Arc<KeyRegistry>,
+    /// Options for new tables (without a data key).
+    pub table_opts: TableOptions,
+    /// Queue to the writer thread; `None` once closing (Go closes `writeCh`).
+    pub write_tx: RwLock<Option<Sender<Request>>>,
+    /// Queue to the flush thread.
+    pub flush_tx: Sender<FlushMsg>,
+    pub block_writes: AtomicBool,
     banned_namespaces: RwLock<HashSet<u64>>,
     closed: AtomicBool,
     // Released last (fields drop in declaration order).
@@ -57,15 +84,14 @@ pub(crate) struct DbInner {
 }
 
 impl DB {
-    /// Opens the database described by `opt`.
-    ///
-    /// Only read-only mode (`opt.read_only`) is implemented so far.
+    /// Opens (or creates) the database described by `opt`.
     pub fn open(opt: Options) -> Result<DB> {
         Self::open_inner(opt, false)
     }
 
     /// Opens a database whose transaction timestamps the application manages
-    /// (Go's `OpenManaged`). Read with [`DB::new_transaction_at`].
+    /// (Go's `OpenManaged`): read with [`DB::new_transaction_at`], commit with
+    /// [`Txn::commit_at`].
     pub fn open_managed(opt: Options) -> Result<DB> {
         Self::open_inner(opt, true)
     }
@@ -73,40 +99,45 @@ impl DB {
     fn open_inner(mut opt: Options, managed: bool) -> Result<DB> {
         opt.managed_txns = managed;
         opt.check_and_set()?;
-        if !opt.read_only {
-            return Err(Error::InvalidOptions(
-                "only read-only mode is implemented so far".into(),
-            ));
-        }
 
         let mut dir_locks = Vec::new();
-        if !opt.in_memory && !opt.bypass_lock_guard {
-            dir_locks.push(DirLockGuard::acquire(&opt.dir, opt.read_only)?);
-            let abs = |p| std::path::absolute(p).map_err(Error::from);
-            if abs(&opt.value_dir)? != abs(&opt.dir)? {
-                dir_locks.push(DirLockGuard::acquire(&opt.value_dir, opt.read_only)?);
+        if !opt.in_memory {
+            if !opt.read_only {
+                create_dirs(&opt)?;
+            }
+            if !opt.bypass_lock_guard {
+                dir_locks.push(DirLockGuard::acquire(&opt.dir, opt.read_only)?);
+                let abs = |p| std::path::absolute(p).map_err(Error::from);
+                if abs(&opt.value_dir)? != abs(&opt.dir)? {
+                    dir_locks.push(DirLockGuard::acquire(&opt.value_dir, opt.read_only)?);
+                }
             }
         }
 
         let (manifest_file, manifest) = ManifestFile::open_or_create(&opt)?;
-
         let block_cache = (opt.block_cache_size > 0).then(|| new_block_cache(opt.block_cache_size));
         let index_cache = (opt.index_cache_size > 0).then(|| new_index_cache(opt.index_cache_size));
-
         let registry = Arc::new(KeyRegistry::open(KeyRegistryOptions::from_options(&opt))?);
 
-        let (imm, _next_mem_fid) =
+        let (imm, next_mem_fid) =
             open_mem_tables(&opt, &registry).context("while opening memtables")?;
-        let mem = MemTables {
+        let mut mem = MemTables {
             mt: None,
             imm: imm.into_iter().map(Arc::new).collect(),
+            next_mem_fid,
         };
+        if !opt.read_only {
+            let mt = MemTable::create(&opt, &registry, mem.next_mem_fid)
+                .context("cannot create memtable")?;
+            mem.next_mem_fid += 1;
+            mem.mt = Some(Arc::new(mt));
+        }
 
-        let base = base_table_options(&opt, block_cache, index_cache);
-        let lc = LevelsController::open(&opt, &manifest, &registry, &base)?;
-        let vlog = ValueLog::open(&opt, &registry).context("During db.vlog.open")?;
+        let table_opts = base_table_options(&opt, block_cache, index_cache);
+        let lc = LevelsController::open(&opt, &manifest, &registry, &table_opts)?;
 
-        // Reads start at the newest version found.
+        // Reads start at the newest version found (before the value log is
+        // opened, as in Go).
         let max_version = mem
             .imm
             .iter()
@@ -114,24 +145,75 @@ impl DB {
             .chain(lc.table_info().iter().map(|t| t.max_version))
             .max()
             .unwrap_or(0);
-        let inner = DbInner {
-            orc: Oracle::new(managed, max_version),
-            opt,
-            mem: RwLock::new(mem),
+        let vlog = ValueLog::open(&opt, Arc::clone(&registry)).context("During db.vlog.open")?;
+
+        let (write_tx, write_rx) = crossbeam_channel::bounded(WRITE_CH_CAPACITY);
+        let (flush_tx, flush_rx) = crossbeam_channel::bounded(opt.num_memtables.max(1));
+        let imm_to_flush = if opt.read_only {
+            Vec::new()
+        } else {
+            mem.imm.clone()
+        };
+        let inner = Arc::new(DbInner {
+            orc: Oracle::new(managed, opt.detect_conflicts, max_version),
+            mem: Mutex::new(mem),
+            flush_cond: Condvar::new(),
             lc,
             vlog,
             manifest: manifest_file,
             registry,
+            table_opts,
+            write_tx: RwLock::new((!opt.read_only).then_some(write_tx)),
+            flush_tx,
+            block_writes: AtomicBool::new(opt.read_only),
             banned_namespaces: RwLock::new(HashSet::new()),
             closed: AtomicBool::new(false),
             _dir_locks: dir_locks,
+            opt,
+        });
+
+        let mut db = DB {
+            inner,
+            writer: None,
+            flusher: None,
         };
-        let db = DB {
-            inner: Arc::new(inner),
-        };
+        if !db.inner.opt.read_only {
+            db.start_threads(write_rx, flush_rx)?;
+            // Recovered memtables are flushed right away.
+            for mt in imm_to_flush {
+                db.inner
+                    .flush_tx
+                    .send(Some(mt))
+                    .map_err(|_| Error::DbClosed)?;
+            }
+        }
         db.init_banned_namespaces()
             .context("While setting banned keys")?;
         Ok(db)
+    }
+
+    fn start_threads(
+        &mut self,
+        write_rx: Receiver<Request>,
+        flush_rx: Receiver<FlushMsg>,
+    ) -> Result<()> {
+        let spawn = |name: &str, f: Box<dyn FnOnce() + Send>| {
+            std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(f)
+                .map_err(Error::from)
+        };
+        let inner = Arc::clone(&self.inner);
+        self.flusher = Some(spawn(
+            "badger-flush",
+            Box::new(move || write::flush_loop(&inner, flush_rx)),
+        )?);
+        let inner = Arc::clone(&self.inner);
+        self.writer = Some(spawn(
+            "badger-write",
+            Box::new(move || write::write_loop(&inner, write_rx)),
+        )?);
+        Ok(())
     }
 
     /// Loads the banned namespaces stored under [`BANNED_NS_KEY`].
@@ -173,8 +255,25 @@ impl DB {
         f(&txn)
     }
 
-    /// Starts a transaction (Go's `NewTransaction`). Writes are not
-    /// implemented yet, and `update` is ignored in read-only mode.
+    /// Runs `f` in an update transaction and commits it if `f` succeeds (Go's
+    /// `Update`). Retry on [`Error::Conflict`] if needed.
+    ///
+    /// # Panics
+    /// In managed mode.
+    pub fn update<R>(&self, f: impl FnOnce(&mut Txn<'_>) -> Result<R>) -> Result<R> {
+        self.check_open()?;
+        assert!(
+            !self.inner.opt.managed_txns,
+            "Update can only be used with managedDB=false."
+        );
+        let mut txn = self.new_transaction(true);
+        let r = f(&mut txn)?;
+        txn.commit()?;
+        Ok(r)
+    }
+
+    /// Starts a transaction (Go's `NewTransaction`). `update` is ignored in
+    /// read-only mode.
     ///
     /// # Panics
     /// In managed mode; use [`DB::new_transaction_at`].
@@ -198,6 +297,28 @@ impl DB {
         Txn::new(&self.inner, update, Some(read_ts))
     }
 
+    /// Managed mode: versions at or below `ts` are no longer read (Go's
+    /// `SetDiscardTs`).
+    pub fn set_discard_ts(&self, ts: u64) {
+        assert!(
+            self.inner.opt.managed_txns,
+            "SetDiscardTs needs a managed DB"
+        );
+        self.inner.orc.set_discard_ts(ts);
+    }
+
+    /// Writes the current memtable's WAL and value log file to disk (Go's
+    /// `Sync`).
+    pub fn sync(&self) -> Result<()> {
+        if self.inner.opt.in_memory || self.inner.opt.read_only {
+            return Ok(());
+        }
+        let mt = self.inner.mem.lock().unwrap().mt.clone();
+        let wal = mt.map_or(Ok(()), |mt| mt.sync_wal());
+        let vlog = self.inner.vlog.sync();
+        wal.and(vlog)
+    }
+
     /// The newest version in the DB.
     pub fn max_version(&self) -> u64 {
         self.inner.max_version()
@@ -213,6 +334,16 @@ impl DB {
         &self.inner.opt
     }
 
+    /// Largest number of entries in one transaction.
+    pub fn max_batch_count(&self) -> u64 {
+        self.inner.opt.max_batch_count()
+    }
+
+    /// Largest size of one transaction, in bytes.
+    pub fn max_batch_size(&self) -> u64 {
+        self.inner.opt.max_batch_size()
+    }
+
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
     }
@@ -224,19 +355,75 @@ impl DB {
         Ok(())
     }
 
-    /// Closes the DB, releasing its files and directory lock. Dropping it
-    /// does the same; `close` reports errors.
-    pub fn close(self) -> Result<()> {
-        self.inner.closed.store(true, Ordering::SeqCst);
-        // Nothing to flush in read-only mode; files close as they drop.
-        Ok(())
+    /// Closes the DB: waits for queued writes, flushes the memtable to L0,
+    /// truncates the value log and releases the files and the directory
+    /// lock. Dropping the DB does the same but cannot report errors.
+    pub fn close(mut self) -> Result<()> {
+        self.close_impl()
+    }
+
+    fn close_impl(&mut self) -> Result<()> {
+        let inner = &self.inner;
+        {
+            // Under the memtable lock, so a writer waiting for room sees it.
+            let _mem = inner.mem.lock().unwrap();
+            if inner.closed.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            inner.block_writes.store(true, Ordering::SeqCst);
+        }
+        inner.flush_cond.notify_all();
+        if inner.opt.read_only {
+            return Ok(());
+        }
+
+        // Stop the writer once it has drained the queue: dropping the sender
+        // disconnects the channel after the queued requests.
+        drop(inner.write_tx.write().unwrap().take());
+        if let Some(t) = self.writer.take() {
+            let _ = t.join();
+        }
+
+        // Flush the current memtable, or delete its WAL if it is empty.
+        let mt = inner.mem.lock().unwrap().mt.take();
+        if let Some(mt) = mt {
+            if mt.skiplist().is_empty() {
+                mt.delete_wal_on_drop();
+            } else if self.flusher.is_some() {
+                inner.mem.lock().unwrap().imm.push(Arc::clone(&mt));
+                let _ = inner.flush_tx.send(Some(mt));
+            }
+            // Without a flush thread (it failed to start), the WAL stays and
+            // is replayed on the next open.
+        }
+        if let Some(t) = self.flusher.take() {
+            let _ = inner.flush_tx.send(None);
+            let _ = t.join();
+        }
+
+        let mut result = inner.vlog.close().context("DB.Close");
+        for dir in [&inner.opt.dir, &inner.opt.value_dir] {
+            if !inner.opt.in_memory {
+                let r = sync_dir(dir).context("DB.Close");
+                result = result.and(r);
+            }
+        }
+        result
+    }
+}
+
+impl Drop for DB {
+    fn drop(&mut self) {
+        if let Err(e) = self.close_impl() {
+            log::error!("while closing DB: {e}");
+        }
     }
 }
 
 impl DbInner {
     /// Memtables to read, newest first.
     pub(crate) fn mem_tables(&self) -> Vec<Arc<MemTable>> {
-        let mem = self.mem.read().unwrap();
+        let mem = self.mem.lock().unwrap();
         mem.mt.iter().chain(mem.imm.iter().rev()).cloned().collect()
     }
 
@@ -279,6 +466,15 @@ impl DbInner {
         from_mem.max(from_tables)
     }
 
+    /// Values of at least this many bytes go to the value log.
+    pub(crate) fn value_threshold(&self) -> i64 {
+        self.opt.value_threshold as i64
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     /// Fails with [`Error::BannedKey`] if `key`'s namespace is banned.
     pub(crate) fn is_banned(&self, key: &[u8]) -> Result<()> {
         let Some(off) = self.opt.namespace_offset else {
@@ -293,10 +489,48 @@ impl DbInner {
         }
         Ok(())
     }
+
+    /// Queues `entries` as one write request (Go's `sendToWriteCh`) and
+    /// returns the channel that receives its result.
+    pub(crate) fn send_to_write_ch(&self, mut entries: Vec<Entry>) -> Result<Receiver<Result<()>>> {
+        if self.block_writes.load(Ordering::SeqCst) {
+            return Err(Error::BlockedWrites);
+        }
+        let threshold = self.value_threshold();
+        let size: i64 = entries
+            .iter_mut()
+            .map(|e| e.estimate_size_and_set_threshold(threshold))
+            .sum();
+        if entries.len() as u64 >= self.opt.max_batch_count()
+            || size as u64 >= self.opt.max_batch_size()
+        {
+            return Err(Error::TxnTooBig);
+        }
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let gate = self.write_tx.read().unwrap();
+        let Some(tx) = gate.as_ref() else {
+            return Err(Error::BlockedWrites);
+        };
+        tx.send(Request {
+            entries,
+            done: done_tx,
+        })
+        .map_err(|_| Error::BlockedWrites)?;
+        Ok(done_rx)
+    }
+}
+
+impl DbInner {
+    /// Writes `entries` (keys with versions) as one batch and waits for it
+    /// (Go's `batchSet`).
+    #[allow(dead_code)] // used by WriteBatch (Phase 7) and tests
+    pub(crate) fn batch_set(&self, entries: Vec<Entry>) -> Result<()> {
+        let rx = self.send_to_write_ch(entries)?;
+        rx.recv().unwrap_or(Err(Error::DbClosed))
+    }
 }
 
 /// Creates the DB directories if missing (Go's `createDirs`).
-#[allow(dead_code)] // used once DBs can be created (Phase 5)
 pub(crate) fn create_dirs(opt: &Options) -> Result<()> {
     for dir in [&opt.dir, &opt.value_dir] {
         fs::create_dir_all(dir)
@@ -304,3 +538,7 @@ pub(crate) fn create_dirs(opt: &Options) -> Result<()> {
     }
     Ok(())
 }
+
+// Miri cannot mmap files.
+#[cfg(all(test, not(miri)))]
+mod tests;

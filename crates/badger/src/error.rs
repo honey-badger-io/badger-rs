@@ -90,6 +90,10 @@ pub enum Error {
     ProtoDecode(#[from] prost::DecodeError),
     #[error("flatbuffer: {0}")]
     Flatbuffer(#[from] flatbuffers::InvalidFlatbuffer),
+    /// One error reported to several callers (e.g. every transaction in a
+    /// failed write batch).
+    #[error(transparent)]
+    Shared(std::sync::Arc<Error>),
     /// Another error with added context (Go's `y.Wrapf`).
     #[error("{context}: {source}")]
     Context {
@@ -103,10 +107,13 @@ impl Error {
     /// The innermost error, skipping any [`Error::Context`] layers.
     pub fn root(&self) -> &Error {
         let mut e = self;
-        while let Error::Context { source, .. } = e {
-            e = source;
+        loop {
+            match e {
+                Error::Context { source, .. } => e = source,
+                Error::Shared(inner) => e = inner,
+                _ => return e,
+            }
         }
-        e
     }
 
     pub(crate) fn corruption(msg: impl Display) -> Self {
