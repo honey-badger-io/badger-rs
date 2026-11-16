@@ -1,6 +1,6 @@
 GO_FIXTURES := compat/go-fixtures
 
-.PHONY: check fmt clippy test fixtures golden miri compat verify go-fixtures
+.PHONY: check fmt clippy test fixtures golden miri loom compat verify go-fixtures
 
 ## check: everything CI runs for Rust (format, lint, tests)
 check: fmt clippy test
@@ -26,6 +26,11 @@ golden:
 ## miri: run unit tests under Miri (needs a nightly toolchain with miri)
 miri:
 	MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test -p badger --lib
+
+## loom: explore skiplist thread interleavings with loom (separate target dir,
+## since --cfg loom changes how the crate is built)
+loom:
+	RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p badger --lib --release skl::loom_tests
 
 ## compat: build tables with Rust and check them with Go Badger
 COMPAT_OUT := target/compat

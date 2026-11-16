@@ -27,10 +27,38 @@ func seqBytes(start byte, n int) []byte {
 	return b
 }
 
-func generate(out string) error {
-	if err := prepareOutDir(out); err != nil {
+// generate writes every fixture into out. With names, it only (re)generates
+// those fixtures and keeps the others in out as they are, so adding a fixture
+// does not churn the committed ones (regenerating is not byte-reproducible).
+func generate(out string, names ...string) error {
+	only := map[string]bool{}
+	for _, n := range names {
+		only[n] = true
+	}
+	var old Index
+	if len(only) > 0 {
+		if err := readJSON(filepath.Join(out, "index.json"), &old); err != nil {
+			return fmt.Errorf("partial gen needs an existing fixture dir: %w", err)
+		}
+	} else if err := prepareOutDir(out); err != nil {
 		return err
 	}
+	existing := map[string]IndexEntry{}
+	for _, e := range old.Fixtures {
+		existing[e.Kind+"/"+e.Name] = e
+	}
+	// keep returns the existing index entry of a fixture that is not selected.
+	seen := map[string]bool{}
+	// A name selects both the db and the sst fixture of that name, if any.
+	keep := func(kind, name string) (IndexEntry, bool) {
+		seen[name] = true
+		if len(only) == 0 || only[name] {
+			return IndexEntry{}, false
+		}
+		e, ok := existing[kind+"/"+name]
+		return e, ok
+	}
+
 	tmp, err := os.MkdirTemp("", "badger-fixtures-")
 	if err != nil {
 		return err
@@ -39,22 +67,39 @@ func generate(out string) error {
 
 	idx := Index{FormatVersion: FormatVersion, BadgerVersion: BadgerVersion}
 	for i, s := range dbScenarios() {
+		if e, ok := keep("db", s.name); ok {
+			idx.Fixtures = append(idx.Fixtures, e)
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(out, "db", s.name)); err != nil {
+			return err
+		}
+		// Seeded by position: append new scenarios to keep the others' data.
 		r := rand.New(rand.NewPCG(0xbad6e5, uint64(i)))
 		e, err := genDB(out, tmp, s, r)
 		if err != nil {
 			return fmt.Errorf("db fixture %s: %w", s.name, err)
 		}
 		idx.Fixtures = append(idx.Fixtures, e)
-		fmt.Printf("db  %-16s %s\n", s.name, s.desc)
+		fmt.Printf("db  %-20s %s\n", s.name, s.desc)
 	}
 	for i, s := range sstScenarios() {
+		if e, ok := keep("sst", s.name); ok {
+			idx.Fixtures = append(idx.Fixtures, e)
+			continue
+		}
 		r := rand.New(rand.NewPCG(0x55747, uint64(i)))
 		e, err := genSST(out, s, r)
 		if err != nil {
 			return fmt.Errorf("sst fixture %s: %w", s.name, err)
 		}
 		idx.Fixtures = append(idx.Fixtures, e)
-		fmt.Printf("sst %-16s %s\n", s.name, s.desc)
+		fmt.Printf("sst %-20s %s\n", s.name, s.desc)
+	}
+	for name := range only {
+		if !seen[name] {
+			return fmt.Errorf("unknown fixture %q", name)
+		}
 	}
 	return writeJSON(filepath.Join(out, "index.json"), idx)
 }
@@ -204,6 +249,16 @@ func dbScenarios() []dbScenario {
 			opts:  with(func(o *DBOptions) { o.ValueThreshold = 64 }),
 			crash: true,
 			write: writeMixed("crash", 1500),
+		},
+		{
+			name: "crash-wal-encrypted",
+			desc: "like crash-wal, with AES-256 encryption: encrypted WAL and vlog entries",
+			opts: with(func(o *DBOptions) {
+				o.EncryptionKey = fixtureEncryptionKey
+				o.ValueThreshold = 64
+			}),
+			crash: true,
+			write: writeMixed("crashenc", 1500),
 		},
 	}
 }

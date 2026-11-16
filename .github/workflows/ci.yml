@@ -61,9 +61,16 @@ jobs:
           go build -o go-fixtures .
           for json in ../fixtures/db/*.json; do
             name=$(basename "$json" .json)
-            [ "$name" = crash-wal ] && continue  # cannot be opened read-only
+            case "$name" in crash-wal*) continue ;; esac  # cannot be opened read-only
             ./go-fixtures verify "../fixtures/db/$name" "$json"
           done
+
+  loom:
+    name: Loom (skiplist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make loom
 
   miri:
     name: Miri

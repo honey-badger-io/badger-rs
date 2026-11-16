@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 2 done (2026-11-15). Next: Phase 3.
+**Status:** Phase 3 done (2026-11-16). Next: Phase 4.
 
 ## Decisions
 
@@ -15,7 +15,7 @@ Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.
 | API style | Closure-based, mirroring Go: `db.update(\|txn\| ...)`, `item.value(\|v\| ...)` |
 | Errors | `Result<T, Error>` everywhere; a `thiserror` enum mirroring `errors.go`; no `y.Check`-style panics |
 | Ref counting | Go `IncrRef`/`DecrRef` → `Arc` + `Drop` (the file is deleted when the last reference drops) |
-| Go reference source | `~/Projects/badger` at tag `v4.9.6` (`git worktree add ../badger-go-v4.9.6 v4.9.6`) |
+| Go reference source | `~/Projects/badger` at tag `v4.9.6` (`git worktree add ../badger-go-v4.9.6 v4.9.6`), or the module cache copy `~/go/pkg/mod/github.com/dgraph-io/badger/v4@v4.9.6` |
 
 ## Size of the Go source (v4.9.6)
 
@@ -165,14 +165,48 @@ Deviations and findings:
   - SSTs from Rust's builder (no compression, no encryption) are **byte-identical** to Go's for the same input,
   - SSTs from Rust's builder (compressed/encrypted) are readable by Go.
 
-### Phase 3: skiplist + memtable (`skl/`, `memtable.go`)
+### Phase 3: skiplist + memtable (`skl/`, `memtable.go`) (done)
+Result: `crates/badger/src/{skl,memtable,log_file,key_registry}` and
+`util/file.rs` (`MmapFile`, `sync_dir`). Go's skiplist tests are ported
+(`skl/tests.rs`, also run under Miri), plus loom models (`skl/loom_tests.rs`,
+`make loom`, CI) and memtable/WAL tests. `tests/memtable_compat.rs` replays the
+Go crash fixtures' WALs (`crash-wal` and the new `crash-wal-encrypted`) and
+matches Go's recovered contents, resolving value pointers through the vlog.
+
+Deviations and findings:
+- Atomics use acquire/release instead of Go's sequential consistency: the
+  release CAS that links a node publishes its bytes, and the release store
+  of the value word publishes a new value.
+- Loom cannot model atomics placed in raw memory, so under `cfg(loom)` the
+  arena keeps its atomic words in side tables. Loom then checks the CAS
+  protocol (a racy load-then-store link is caught), while Miri checks the
+  publication of the plain bytes (a `Relaxed` link CAS is reported as a data
+  race). Neither tool catches both kinds of bug.
+- Under loom, tower heights come from a hash of the key, since loom requires
+  every explored execution to be deterministic.
+- Reference counting is `Arc<Skiplist>`. A memtable deletes its WAL on drop
+  only after `delete_wal_on_drop` (the flush path calls it); otherwise
+  dropping it just closes the WAL. `MemTable::put` takes `&self` (the WAL is
+  behind a mutex) so memtables can be shared as `Arc<MemTable>`.
+- `Skiplist::get` returns `Option`. Keys over `u16::MAX` bytes panic instead of
+  being silently truncated; a full arena panics, as in Go.
+- `logFile` has no internal lock yet (the value log will need one for
+  concurrent reads and appends). `errStop` is gone: nothing returns it.
+- The key registry (planned for Phase 4) was ported here, since replaying an
+  encrypted WAL needs it. `WriteKeyRegistry` writes keys sorted by id (Go
+  iterates a map). New keys are flushed with `sync_data` instead of `O_DSYNC`.
+- Replaying a WAL that another `MmapFile` still maps truncates it under that
+  mapping, in Go as well. The DB must never map a file twice.
+- `go-fixtures gen <out> <name>...` regenerates only the named fixtures, so new
+  fixtures can be added without churning the committed ones.
+
 - Arena with `AtomicU32` offsets, lock-free insert with CAS, the same height distribution and node layout.
 - Keep the `unsafe` code in `skl/` only, with safety comments on every block.
 - Memtable = skiplist + WAL (`logFile`): mmapped, preallocated, encrypted entries, truncation on replay.
 - **Done when:** concurrent insert/get tests pass under `loom` (small model) and `miri`, and Go `.mem` fixtures replay correctly.
 
-### Phase 4: open a DB read-only (`manifest.go`, `key_registry.go`, `levels.go`, `level_handler.go`, `db.go` open path)
-- Manifest replay (change sets, rewrite), KEYREGISTRY load, directory lock.
+### Phase 4: open a DB read-only (`manifest.go`, `levels.go`, `level_handler.go`, `db.go` open path)
+- Manifest replay (change sets, rewrite), directory lock (KEYREGISTRY was done in Phase 3).
 - Level handlers, table loading, point `get` across memtables → L0 → Ln with version selection.
 - Read-only `Txn` + `Iterator` (no prefetch yet) and the vlog read path (value pointers).
 - **Done when (the main milestone):** Rust opens every Go fixture DB read-only and matches its JSON dump.

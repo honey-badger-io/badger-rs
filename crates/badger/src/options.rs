@@ -210,6 +210,16 @@ impl Options {
     pub fn lsm_only(path: impl AsRef<Path>) -> Self {
         Self::new(path).with_value_threshold(MAX_VALUE_THRESHOLD)
     }
+
+    /// Largest write batch in bytes: 15% of the memtable (Go's `maxBatchSize`).
+    pub(crate) fn max_batch_size(&self) -> u64 {
+        (15 * self.mem_table_size) / 100
+    }
+
+    /// Most entries in a write batch (Go's `maxBatchCount`).
+    pub(crate) fn max_batch_count(&self) -> u64 {
+        self.max_batch_size() / crate::skl::MAX_NODE_SIZE as u64
+    }
 }
 
 macro_rules! with_methods {

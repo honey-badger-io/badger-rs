@@ -18,11 +18,18 @@
 //! | `errors.go` | [`error`] |
 //! | `structs.go` | [`structs`] |
 //! | `table` | [`table`] |
+//! | `skl` | [`skl`] |
+//! | `memtable.go` | [`memtable`], [`log_file`] |
+//! | `key_registry.go` | [`key_registry`] |
 
 pub mod error;
 pub mod fb;
+pub mod key_registry;
+pub mod log_file;
+pub mod memtable;
 pub mod options;
 pub mod pb;
+pub mod skl;
 pub mod structs;
 pub mod table;
 pub mod trie;

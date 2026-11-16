@@ -6,6 +6,7 @@ on-disk fixtures and to check databases written by the Rust port.
 
 ```sh
 make fixtures                                # regenerate compat/fixtures
+cd go-fixtures && go run . gen ../fixtures <name>...  # (re)generate only these fixtures
 make golden                                  # regenerate compat/golden/phase1.json
 make verify DB=/path/to/db EXPECTED=x.json   # Go opens DB read-only and compares
 make compat                                  # Rust builds tables; Go checks them (verify-sst)
@@ -34,6 +35,11 @@ and encrypted blocks, which also changes vlog offsets inside SSTs. The JSON file
 and unencrypted standalone SSTs *are* reproducible. Regenerate only when
 fixtures change, and commit the result in one go.
 
+To add a fixture, append its scenario to the end of the list in `gen.go`
+(scenarios are seeded by position) and generate just that one with
+`go run . gen ../fixtures <name>`; the others stay untouched. A name selects
+both the DB and the SST fixture of that name, if both exist.
+
 ## Layout
 
 ```
@@ -57,6 +63,7 @@ fixtures/
 | `managed` | managed mode, commit timestamps 10..50 |
 | `levels` | tables in L6 overlapped by newer L0 tables (overwrites and deletes) |
 | `crash-wal` | copied from a live DB: unflushed `.mem` WAL, preallocated vlog |
+| `crash-wal-encrypted` | `crash-wal` with AES-256: encrypted WAL and vlog entries |
 
 Expected file (`db/<name>.json`): every version of every key, as returned by a Go
 iterator with `AllVersions: true` at the newest read timestamp. Order is key
@@ -76,7 +83,7 @@ ascending, then version descending. Byte strings are lowercase hex.
 Expiry uses fixed timestamps (`1` = expired, `4102444800` = 2100-01-01), so
 `deleted_or_expired` does not depend on when the tests run.
 
-`crash-wal` cannot be opened read-only by Go (it would need to truncate the
+`crash-wal` and `crash-wal-encrypted` cannot be opened read-only by Go (it would need to truncate the
 WAL). Its expected contents come from a recovered copy, so a correct port must
 reproduce Badger's replay and truncation logic.
 

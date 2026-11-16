@@ -73,6 +73,13 @@
       "expected": "db/crash-wal.json"
     },
     {
+      "name": "crash-wal-encrypted",
+      "kind": "db",
+      "description": "like crash-wal, with AES-256 encryption: encrypted WAL and vlog entries",
+      "path": "db/crash-wal-encrypted",
+      "expected": "db/crash-wal-encrypted.json"
+    },
+    {
       "name": "plain",
       "kind": "sst",
       "description": "no compression, 4 KiB blocks",
