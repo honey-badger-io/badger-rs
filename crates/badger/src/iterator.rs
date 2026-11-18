@@ -289,6 +289,14 @@ pub struct Iterator<'t> {
     last_key: Vec<u8>,
 }
 
+impl Drop for Iterator<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.txn.db().vlog.decr_iterator_count() {
+            log::error!("while deleting value log files after GC: {e}");
+        }
+    }
+}
+
 impl<'t> Iterator<'t> {
     pub(crate) fn new(txn: &'t Txn<'t>, opt: IteratorOptions, prefix_is_key: bool) -> Self {
         let db = txn.db();
@@ -301,6 +309,8 @@ impl<'t> Iterator<'t> {
             iters.push(Box::new(mt.skiplist().uni_iter(opt.reverse)));
         }
         db.lc.append_iterators(&mut iters, &opt, prefix_is_key);
+        // Value log GC keeps the files this iterator may read until it ends.
+        db.vlog.incr_iterator_count();
         Iterator {
             txn,
             iitr: MergeIterator::merge(iters, opt.reverse),

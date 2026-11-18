@@ -175,7 +175,7 @@ pub(crate) fn flush_loop(db: &DbInner, rx: Receiver<FlushMsg>) {
     while let Ok(Some(mt)) = rx.recv() {
         // Errors are retried forever, as in Go: dropping the memtable would
         // lose acknowledged writes.
-        while let Err(e) = handle_memtable_flush(db, &mt) {
+        while let Err(e) = handle_memtable_flush(db, &mt, &[]) {
             log::error!("error flushing memtable to disk: {e}, retrying");
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -195,14 +195,23 @@ pub(crate) fn flush_loop(db: &DbInner, rx: Receiver<FlushMsg>) {
     }
 }
 
-/// Writes a memtable as a new L0 table (Go's `handleMemTableFlush`).
-fn handle_memtable_flush(db: &DbInner, mt: &MemTable) -> Result<()> {
+/// Writes a memtable as a new L0 table, without the keys starting with one
+/// of `drop_prefixes` (Go's `handleMemTableFlush`).
+pub(crate) fn handle_memtable_flush(
+    db: &DbInner,
+    mt: &MemTable,
+    drop_prefixes: &[Vec<u8>],
+) -> Result<()> {
     let mut topt = db.table_opts.clone();
     topt.data_key = db.registry.latest_data_key()?;
     let mut builder = TableBuilder::new(topt.clone());
     let mut it = mt.skiplist().uni_iter(false);
     it.rewind();
     while it.valid() {
+        if drop_prefixes.iter().any(|p| it.key().starts_with(p)) {
+            it.next();
+            continue;
+        }
         let vs = it.value();
         let vlen = if vs.meta & BIT_VALUE_POINTER != 0 {
             ValuePointer::decode(vs.value)?.len
@@ -222,6 +231,6 @@ fn handle_memtable_flush(db: &DbInner, mt: &MemTable) -> Result<()> {
         Table::create(new_filename(id, &db.opt.dir), builder)?
     };
     db.lc
-        .add_level0_table(table, &db.manifest)
+        .add_level0_table(db, table)
         .context("error while creating table")
 }

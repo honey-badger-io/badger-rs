@@ -168,6 +168,17 @@ impl MmapFile {
         std::fs::remove_file(&path).with_context(|| format!("while removing {}", path.display()))
     }
 
+    /// Like [`MmapFile::delete`], for a file other threads may still hold:
+    /// the mapping is dropped (later reads see no data) and the file removed.
+    pub fn delete_in_place(&mut self) -> Result<()> {
+        self.map = None;
+        self.file
+            .set_len(0)
+            .with_context(|| format!("while truncate file: {}", self.path.display()))?;
+        std::fs::remove_file(&self.path)
+            .with_context(|| format!("while removing {}", self.path.display()))
+    }
+
     /// Syncs, unmaps and closes the file, first resizing it to `max_size` if
     /// given (Go's `Close`).
     pub fn close(self, max_size: Option<u64>) -> Result<()> {

@@ -116,7 +116,6 @@ impl Oracle {
     }
 
     /// Versions at or below this timestamp are invisible to every read.
-    #[allow(dead_code)] // used by compaction (Phase 6)
     pub fn discard_at_or_below(&self) -> u64 {
         if self.is_managed {
             return self.state.lock().unwrap().discard_ts;

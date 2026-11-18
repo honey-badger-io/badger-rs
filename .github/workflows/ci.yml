@@ -51,6 +51,7 @@ jobs:
         run: |
           BADGER_COMPAT_OUT="$RUNNER_TEMP/compat" cargo test -p badger --test table_compat builds_every
           BADGER_COMPAT_OUT="$RUNNER_TEMP/compat" cargo test -p badger --test write_compat
+          BADGER_COMPAT_OUT="$RUNNER_TEMP/compat" cargo test -p badger --test workload
           cd compat/go-fixtures && go build -o go-fixtures .
           for json in "$RUNNER_TEMP"/compat/sst/*.json; do
             name=$(basename "$json" .json)

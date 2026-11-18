@@ -38,6 +38,7 @@ compat: go-fixtures
 	rm -rf $(COMPAT_OUT)
 	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test table_compat builds_every
 	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test write_compat
+	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test workload
 	for json in $(COMPAT_OUT)/sst/*.json; do \
 		name=$$(basename $$json .json); \
 		$(GO_FIXTURES)/go-fixtures verify-sst $(COMPAT_OUT)/sst/$$name/000001.sst $$json || exit 1; \

@@ -1,31 +1,48 @@
 //! The value log: values too big for the LSM tree, stored in `<fid>.vlog`
 //! files (same format as the WAL, see [`crate::log_file`]) and referenced by
-//! [`ValuePointer`]s. Port of Go's `value.go` without garbage collection
-//! (Phase 6).
+//! [`ValuePointer`]s. Port of Go's `value.go`.
 //!
 //! Only the newest file is written. When it passes `value_log_file_size` or
 //! `value_log_max_entries`, it is truncated to its data and a new file is
 //! started. A request's entries always land in one file, so a transaction is
 //! never split across files.
 //!
+//! Garbage collection ([`run_gc`]): compaction counts the bytes of every
+//! value pointer it drops in the discard stats ([`crate::discard`]). GC picks
+//! the file with the most discardable bytes, writes its still-live entries
+//! again (they land in the newest file and the LSM tree gets new pointers),
+//! then deletes it, or defers that until no iterator is open.
+//!
+//! An old version written back also gets the key's newest version written
+//! again after it, so a delete dropped by compaction further down cannot
+//! uncover it (Go has that bug). Versions no read can see may still point
+//! into a deleted file afterwards, as in Go: reading their values (only an
+//! all-versions iteration can) fails.
+//!
 //! Differences from Go: each file sits behind an `RwLock` that the writer
 //! takes for every append (Go appends without it, guarded by the write
 //! offset); readers hold the read side while they use the value. The value
 //! threshold is fixed (`vlog_percentile`, the dynamic threshold, is not
-//! ported yet).
+//! ported).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
+use crate::db::DbInner;
+use crate::discard::DiscardStats;
 use crate::error::{Error, Result, ResultExt};
+use crate::iterator::is_deleted_or_expired;
 use crate::key_registry::KeyRegistry;
 use crate::log_file::{LogFile, VLOG_HEADER_SIZE};
 use crate::options::Options;
-use crate::structs::{BIT_FIN_TXN, BIT_TXN, Entry, Header, ValuePointer};
+use crate::structs::{BIT_FIN_TXN, BIT_TXN, BIT_VALUE_POINTER, Entry, Header, ValuePointer};
+use crate::util::OwnedValueStruct;
+use crate::util::keys::{key_with_ts, parse_key, parse_ts};
 
 /// Extension of value log files.
 pub const VLOG_FILE_EXT: &str = ".vlog";
@@ -40,10 +57,18 @@ pub fn vlog_file_path(dir: &Path, fid: u32) -> PathBuf {
 
 type SharedFile = Arc<RwLock<LogFile>>;
 
+/// The open files.
+#[derive(Default)]
+struct Files {
+    /// By id. Each file has its own lock (Go's `logFile.lock`).
+    map: BTreeMap<u32, SharedFile>,
+    /// Rewritten by GC, deleted once no iterator is open.
+    to_be_deleted: Vec<u32>,
+}
+
 pub(crate) struct ValueLog {
     dir: PathBuf,
-    /// Open files by id. Each file has its own lock (Go's `logFile.lock`).
-    files: RwLock<BTreeMap<u32, SharedFile>>,
+    files: RwLock<Files>,
     /// The file being written: the highest id.
     max_fid: AtomicU32,
     /// End of the data in the file being written (Go's `writableLogOffset`).
@@ -57,6 +82,16 @@ pub(crate) struct ValueLog {
     verify_value_checksum: bool,
     file_size: u64,
     max_entries: u32,
+    /// `None` in read-only and in-memory mode.
+    discard_stats: Option<Mutex<DiscardStats>>,
+    /// Open iterators: GC defers deleting files while any is open.
+    num_active_iterators: AtomicI64,
+    /// Held while GC runs; only one GC at a time.
+    gc_lock: Mutex<()>,
+    /// While a GC rewrite runs, the DB's max version at its start
+    /// (compaction must not drop newer versions; see `subcompact`).
+    gc_active: AtomicBool,
+    gc_discard_ts: AtomicU64,
 }
 
 impl ValueLog {
@@ -66,7 +101,7 @@ impl ValueLog {
     pub fn open(opt: &Options, registry: Arc<KeyRegistry>) -> Result<ValueLog> {
         let vlog = ValueLog {
             dir: opt.value_dir.clone(),
-            files: RwLock::new(BTreeMap::new()),
+            files: RwLock::new(Files::default()),
             max_fid: AtomicU32::new(0),
             writable_offset: AtomicU32::new(0),
             num_entries_written: AtomicU32::new(0),
@@ -77,9 +112,18 @@ impl ValueLog {
             verify_value_checksum: opt.verify_value_checksum,
             file_size: opt.value_log_file_size,
             max_entries: opt.value_log_max_entries,
+            discard_stats: None,
+            num_active_iterators: AtomicI64::new(0),
+            gc_lock: Mutex::new(()),
+            gc_active: AtomicBool::new(false),
+            gc_discard_ts: AtomicU64::new(0),
         };
         if opt.in_memory {
             return Ok(vlog);
+        }
+        let mut vlog = vlog;
+        if !opt.read_only {
+            vlog.discard_stats = Some(Mutex::new(DiscardStats::open(&opt.value_dir)?));
         }
         let fids = vlog.list_fids()?;
         let Some(&max_fid) = fids.last() else {
@@ -113,7 +157,7 @@ impl ValueLog {
             files.insert(fid, Arc::new(RwLock::new(lf)));
         }
         if vlog.read_only {
-            *vlog.files.write().unwrap() = files;
+            vlog.files.write().unwrap().map = files;
             return Ok(vlog);
         }
 
@@ -132,7 +176,7 @@ impl ValueLog {
             })?;
             last.write_at = end;
         }
-        *vlog.files.write().unwrap() = files;
+        vlog.files.write().unwrap().map = files;
         vlog.create_vlog_file()
             .context("Error while creating log file in valueLog.open")?;
         Ok(vlog)
@@ -177,7 +221,7 @@ impl ValueLog {
         }
         let lf = Arc::new(RwLock::new(lf));
         let mut files = self.files.write().unwrap();
-        files.insert(fid, Arc::clone(&lf));
+        files.map.insert(fid, Arc::clone(&lf));
         self.max_fid.store(fid, Ordering::Release);
         self.writable_offset
             .store(VLOG_HEADER_SIZE, Ordering::Release);
@@ -189,6 +233,7 @@ impl ValueLog {
         self.files
             .read()
             .unwrap()
+            .map
             .get(&fid)
             .cloned()
             .ok_or_else(|| Error::corruption(format!("file with ID: {fid} not found")))
@@ -208,6 +253,16 @@ impl ValueLog {
             }
         }
         let lf = lf.read().unwrap();
+        self.read_from(&lf, vp, f)
+    }
+
+    /// Reads the value `vp` points at in `lf`, a file the caller holds.
+    fn read_from<R>(
+        &self,
+        lf: &LogFile,
+        vp: ValuePointer,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
         let buf = lf.read(vp)?;
         if buf.len() < 4 {
             return Err(Error::corruption(format!("Invalid read: vp: {vp:?}")));
@@ -357,7 +412,7 @@ impl ValueLog {
     /// Syncs and closes every file, truncating the one being written to its
     /// data (Go's `valueLog.Close`).
     pub fn close(&self) -> Result<()> {
-        let files = std::mem::take(&mut *self.files.write().unwrap());
+        let files = std::mem::take(&mut self.files.write().unwrap().map);
         let max_fid = self.max_fid.load(Ordering::Acquire);
         let mut first_err = None;
         for (fid, lf) in files {
@@ -374,12 +429,329 @@ impl ValueLog {
                 first_err.get_or_insert(e);
             }
         }
+        if let Some(ds) = &self.discard_stats
+            && let Err(e) = ds.lock().unwrap().sync()
+        {
+            first_err.get_or_insert(e);
+        }
         first_err.map_or(Ok(()), Err)
     }
 
-    /// Ids of the open files, ascending.
-    #[allow(dead_code)] // used by GC (Phase 6)
+    /// Ids of the open files not waiting for deletion, ascending.
+    #[allow(dead_code)] // used by tests
     pub fn sorted_fids(&self) -> Vec<u32> {
-        self.files.read().unwrap().keys().copied().collect()
+        let files = self.files.read().unwrap();
+        files
+            .map
+            .keys()
+            .filter(|fid| !files.to_be_deleted.contains(fid))
+            .copied()
+            .collect()
     }
+
+    /// Adds bytes that compaction dropped to the discard stats (Go's
+    /// `updateDiscardStats`).
+    pub fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
+        let Some(ds) = &self.discard_stats else {
+            return;
+        };
+        let mut ds = ds.lock().unwrap();
+        for (&fid, &discard) in stats {
+            if let Err(e) = ds.update(fid, discard) {
+                log::error!("while updating discard stats: {e}");
+            }
+        }
+    }
+
+    /// The discardable bytes recorded for file `fid`.
+    #[allow(dead_code)] // used by tests
+    pub(crate) fn discard_of(&self, fid: u32) -> i64 {
+        self.discard_stats
+            .as_ref()
+            .map_or(0, |ds| ds.lock().unwrap().update(fid, 0).unwrap_or(0))
+    }
+
+    /// While a GC rewrite runs, the max version at its start.
+    pub fn gc_discard_ts(&self) -> Option<u64> {
+        self.gc_active
+            .load(Ordering::SeqCst)
+            .then(|| self.gc_discard_ts.load(Ordering::SeqCst))
+    }
+
+    pub fn incr_iterator_count(&self) {
+        self.num_active_iterators.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The last open iterator deletes the files GC rewrote meanwhile.
+    pub fn decr_iterator_count(&self) -> Result<()> {
+        if self.num_active_iterators.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return Ok(());
+        }
+        let lfs: Vec<SharedFile> = {
+            let mut files = self.files.write().unwrap();
+            let ids = std::mem::take(&mut files.to_be_deleted);
+            ids.iter().filter_map(|id| files.map.remove(id)).collect()
+        };
+        lfs.iter().try_for_each(|lf| self.delete_log_file(lf))
+    }
+
+    fn delete_log_file(&self, lf: &SharedFile) -> Result<()> {
+        let mut lf = lf.write().unwrap();
+        if let Some(ds) = &self.discard_stats {
+            ds.lock().unwrap().update(lf.fid, -1)?;
+        }
+        lf.delete_in_place()
+    }
+
+    /// Deletes every file and starts again at file 1 (Go's `dropAll`).
+    /// Writes must be blocked. Returns the number of files deleted.
+    pub fn drop_all(&self) -> Result<usize> {
+        if self.in_memory {
+            return Ok(0);
+        }
+        let lfs: Vec<SharedFile> = {
+            let mut files = self.files.write().unwrap();
+            files.to_be_deleted.clear();
+            std::mem::take(&mut files.map).into_values().collect()
+        };
+        for lf in &lfs {
+            self.delete_log_file(lf)?;
+        }
+        self.max_fid.store(0, Ordering::Release);
+        log::info!("Value logs deleted. Creating value log file: 1");
+        self.create_vlog_file()?;
+        Ok(lfs.len())
+    }
+
+    /// The file with the most discardable data, if that is at least
+    /// `discard_ratio` of it and it is not the file being written (Go's
+    /// `pickLog`).
+    fn pick_log(&self, discard_ratio: f64) -> Option<SharedFile> {
+        let ds = self.discard_stats.as_ref()?;
+        let files = self.files.read().unwrap();
+        loop {
+            let (fid, discard) = ds.lock().unwrap().max_discard();
+            // File ids start at 1.
+            if fid == 0 {
+                log::debug!("No file with discard stats");
+                return None;
+            }
+            let Some(lf) = files.map.get(&fid) else {
+                // Deleted, but compaction still found pointers into it.
+                let _ = ds.lock().unwrap().update(fid, -1);
+                continue;
+            };
+            let size = lf.read().unwrap().size() as f64;
+            let threshold = discard_ratio * size;
+            if (discard as f64) < threshold {
+                log::debug!(
+                    "Discard: {discard} less than threshold: {threshold:.0} for file: {fid}"
+                );
+                return None;
+            }
+            if fid < self.max_fid.load(Ordering::Acquire) {
+                log::info!("Found value log max discard fid: {fid} discard: {discard}");
+                return Some(Arc::clone(lf));
+            }
+            return None;
+        }
+    }
+}
+
+/// Runs value log GC once (Go's `runGC`): rewrites the file with the most
+/// discardable data, if it has at least `discard_ratio` of it.
+pub(crate) fn run_gc(db: &DbInner, discard_ratio: f64) -> Result<()> {
+    let vlog = &db.vlog;
+    let Ok(_gc) = vlog.gc_lock.try_lock() else {
+        return Err(Error::Rejected);
+    };
+    let Some(lf) = vlog.pick_log(discard_ratio) else {
+        return Err(Error::NoRewrite);
+    };
+    let fid = lf.read().unwrap().fid;
+    rewrite(db, fid, &lf)?;
+    if let Some(ds) = &vlog.discard_stats {
+        ds.lock().unwrap().update(fid, -1)?;
+    }
+    Ok(())
+}
+
+/// Rewrites file `fid` directly (Go's tests call `vlog.rewrite`).
+#[cfg(all(test, not(miri)))]
+pub(crate) fn rewrite_for_test(db: &DbInner, fid: u32) -> Result<()> {
+    let lf = db.vlog.file(fid)?;
+    rewrite(db, fid, &lf)
+}
+
+/// Clears `gc_active` when the rewrite ends, however it ends.
+struct GcActive<'a>(&'a ValueLog);
+
+impl Drop for GcActive<'_> {
+    fn drop(&mut self) {
+        self.0.gc_active.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Whether a value log entry is garbage, given what the LSM tree holds for
+/// its key and version (Go's `discardEntry`).
+fn discard_entry(e: &Entry, vs: Option<&OwnedValueStruct>) -> bool {
+    let Some(vs) = vs else { return true };
+    // A different version: this one was dropped.
+    vs.version != parse_ts(&e.key)
+        // The LSM tree holds the value itself.
+        || vs.meta & BIT_VALUE_POINTER == 0
+        // A transaction's finish mark.
+        || vs.meta & BIT_FIN_TXN != 0
+}
+
+/// Writes the live entries of file `fid` again and deletes it (Go's
+/// `rewrite`).
+fn rewrite(db: &DbInner, fid: u32, lf: &SharedFile) -> Result<()> {
+    let vlog = &db.vlog;
+    {
+        let files = vlog.files.read().unwrap();
+        if files.to_be_deleted.contains(&fid) {
+            return Err(Error::corruption(format!(
+                "value log file already marked for deletion fid: {fid}"
+            )));
+        }
+        let max_fid = vlog.max_fid.load(Ordering::Acquire);
+        assert!(
+            fid < max_fid,
+            "fid to move: {fid}. Current max fid: {max_fid}"
+        );
+    }
+    log::info!("Rewriting fid: {fid}");
+    // Until the rewrite ends, compaction keeps versions newer than now: a
+    // delete committed after this point must shadow the values written back.
+    vlog.gc_discard_ts.store(db.max_version(), Ordering::SeqCst);
+    vlog.gc_active.store(true, Ordering::SeqCst);
+    let _active = GcActive(vlog);
+
+    let max_count = db.opt.max_batch_count() as usize;
+    let max_size = db.opt.max_batch_size() as i64;
+    let mut wb: Vec<Entry> = Vec::with_capacity(1000);
+    let mut size = 0i64;
+    let (mut count, mut moved) = (0usize, 0usize);
+    {
+        let file = lf.read().unwrap();
+        file.iterate(0, |e, vp| {
+            count += 1;
+            if count.is_multiple_of(100_000) {
+                log::debug!("Processing entry {count}");
+            }
+            if is_deleted_or_expired(e.meta, e.expires_at) {
+                return Ok(());
+            }
+            let vs = db.get(&e.key)?;
+            if discard_entry(e, vs.as_ref()) {
+                return Ok(());
+            }
+            let vs = vs.unwrap();
+            if vs.value.is_empty() {
+                return Err(Error::corruption(format!("Empty value: {vs:?}")));
+            }
+            let lsm_vp = ValuePointer::decode(&vs.value)?;
+            // The LSM tree points at a newer copy (or, after GC of an older
+            // file, at an older one that compaction will drop).
+            if lsm_vp.fid > fid || lsm_vp.offset > vp.offset {
+                return Ok(());
+            }
+            if lsm_vp.fid == fid && lsm_vp.offset == vp.offset {
+                moved += 1;
+                let mut moves = vec![Entry {
+                    key: e.key.clone(),
+                    value: e.value.clone(),
+                    expires_at: e.expires_at,
+                    user_meta: e.user_meta,
+                    // Keep the other bits.
+                    meta: e.meta & !(BIT_VALUE_POINTER | BIT_TXN | BIT_FIN_TXN),
+                    ..Default::default()
+                }];
+                // An older version written back lands above the newer ones.
+                // Write the newest one again after it, or once compaction
+                // drops that newest version (say, a delete) further down,
+                // the old value would come back. (Go only guards against
+                // deletes committed during the rewrite.)
+                let user_key = parse_key(&e.key);
+                if let Some(newest) = db.get(&key_with_ts(user_key, u64::MAX))?
+                    && newest.version > parse_ts(&e.key)
+                {
+                    let value = if newest.meta & BIT_VALUE_POINTER != 0 {
+                        let nvp = ValuePointer::decode(&newest.value)?;
+                        if nvp.fid == fid {
+                            vlog.read_from(&file, nvp, |v| v.to_vec())?
+                        } else {
+                            vlog.read(nvp, |v| v.to_vec())?
+                        }
+                    } else {
+                        newest.value.clone()
+                    };
+                    moves.push(Entry {
+                        key: key_with_ts(user_key, newest.version),
+                        value,
+                        expires_at: newest.expires_at,
+                        user_meta: newest.user_meta,
+                        meta: newest.meta & !(BIT_VALUE_POINTER | BIT_TXN | BIT_FIN_TXN),
+                        ..Default::default()
+                    });
+                }
+                // The value counts too (Go #1292).
+                let es: i64 = moves
+                    .iter_mut()
+                    .map(|ne| {
+                        ne.estimate_size_and_set_threshold(db.value_threshold())
+                            + ne.value.len() as i64
+                    })
+                    .sum();
+                if wb.len() + moves.len() >= max_count || size + es >= max_size {
+                    db.batch_set(std::mem::take(&mut wb))?;
+                    size = 0;
+                }
+                wb.extend(moves);
+                size += es;
+            }
+            Ok(())
+        })?;
+    }
+
+    // Write back in batches, halving them while they are too big.
+    let mut batch_size = 1024;
+    let mut loops = 0;
+    let mut i = 0;
+    while i < wb.len() {
+        loops += 1;
+        if batch_size == 0 {
+            log::warn!("We shouldn't reach batch size of zero.");
+            return Err(Error::NoRewrite);
+        }
+        let end = (i + batch_size).min(wb.len());
+        match db.batch_set(wb[i..end].to_vec()) {
+            Ok(()) => i = end,
+            Err(e) if matches!(e.root(), Error::TxnTooBig) => batch_size /= 2,
+            Err(e) => return Err(e),
+        }
+    }
+    log::info!("Processed {} entries in {loops} loops", wb.len());
+    log::info!("Total entries: {count}. Moved: {moved}");
+    log::info!("Removing fid: {fid}");
+
+    // The entries are in the LSM tree: the file can go, now or when the last
+    // open iterator closes.
+    let delete_now = {
+        let mut files = vlog.files.write().unwrap();
+        if !files.map.contains_key(&fid) {
+            return Err(Error::corruption(format!("Unable to find fid: {fid}")));
+        }
+        if vlog.num_active_iterators.load(Ordering::SeqCst) == 0 {
+            files.map.remove(&fid)
+        } else {
+            files.to_be_deleted.push(fid);
+            None
+        }
+    };
+    if let Some(lf) = delete_now {
+        vlog.delete_log_file(&lf)?;
+    }
+    Ok(())
 }

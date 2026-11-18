@@ -266,6 +266,8 @@ with_methods! {
     with_value_log_max_entries => value_log_max_entries: u32;
     with_num_compactors => num_compactors: usize;
     with_compact_l0_on_close => compact_l0_on_close: bool;
+    /// Compactor 2 also rewrites last-level tables with much stale data.
+    with_lmax_compaction => lmax_compaction: bool;
     with_zstd_compression_level => zstd_compression_level: i32;
     with_verify_value_checksum => verify_value_checksum: bool;
     with_encryption_key => encryption_key: Vec<u8>;

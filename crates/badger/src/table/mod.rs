@@ -111,6 +111,7 @@ struct CheapIndex {
     on_disk_size: u32,
     bloom_filter_len: usize,
     offsets_len: usize,
+    stale_data_size: u32,
 }
 
 /// An open SSTable.
@@ -299,6 +300,7 @@ impl Table {
             on_disk_size: ti.on_disk_size(),
             bloom_filter_len: ti.bloom_filter().map_or(0, |b| b.len()),
             offsets_len: ti.offsets().map_or(0, |o| o.len()),
+            stale_data_size: ti.stale_data_size(),
         };
         if self.cheap.offsets_len == 0 {
             return Err(bad("table has no blocks"));
@@ -533,8 +535,10 @@ impl Table {
     pub fn on_disk_size(&self) -> u32 {
         self.cheap.on_disk_size
     }
-    pub fn stale_data_size(&self) -> Result<u32> {
-        self.with_index(|ti| ti.stale_data_size())
+    /// Bytes of keys and values that a compaction can drop (expired or
+    /// superseded entries added with `add_stale_key`).
+    pub fn stale_data_size(&self) -> u32 {
+        self.cheap.stale_data_size
     }
     /// File size in bytes.
     pub fn size(&self) -> u64 {
@@ -561,6 +565,11 @@ impl Table {
     }
     pub fn created_at(&self) -> SystemTime {
         self.created_at
+    }
+    /// Makes the table look older (tests of compaction picking).
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn set_created_at(&mut self, t: SystemTime) {
+        self.created_at = t;
     }
     pub fn is_in_memory(&self) -> bool {
         self.path.is_none()

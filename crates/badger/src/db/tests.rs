@@ -19,7 +19,6 @@ fn test_options(dir: &std::path::Path) -> Options {
         .with_base_level_size(4 << 15)
         .with_value_log_file_size(1 << 20)
         .with_value_threshold(32)
-        .with_num_compactors(0)
         .with_compression(crate::options::CompressionType::None)
 }
 

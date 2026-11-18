@@ -3,13 +3,19 @@
 //! Opening replays the manifest, the memtable WALs and the value log. Reads
 //! go through memtables → L0 → Ln. Writes are queued to a writer thread
 //! (see [`crate::write`]), which appends to the value log and the memtable;
-//! full memtables are flushed to L0 tables by a flush thread.
+//! full memtables are flushed to L0 tables by a flush thread, and compactor
+//! threads ([`crate::compaction`]) push tables down the levels. Value log GC
+//! runs when the application calls [`DB::run_value_log_gc`].
 //!
 //! Differences from Go:
 //! - Background work runs on `std` threads; [`DB::close`] (or dropping the
 //!   DB) stops and joins them.
-//! - No compaction, value log GC or L0 write stalls yet (Phase 6), no
-//!   subscriptions (Phase 7).
+//! - Blocking writes for a drop does not restart the writer and flush
+//!   threads: the writer is drained with an empty request, and the drop
+//!   waits for the flush queue to empty.
+//! - `drop_all` does not restart table ids at 1, so a table still open in a
+//!   reader can never share a file name with a new one.
+//! - No subscriptions yet (Phase 7).
 
 use std::collections::HashSet;
 use std::fs;
@@ -19,11 +25,12 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender};
 
+use crate::compaction::{self, CompactionPriority};
 use crate::dir_lock::DirLockGuard;
 use crate::error::{Error, Result, ResultExt};
 use crate::iterator::IteratorOptions;
 use crate::key_registry::{KeyRegistry, KeyRegistryOptions};
-use crate::levels::{LevelsController, TableInfo, base_table_options};
+use crate::levels::{LevelInfo, LevelsController, TableInfo, base_table_options};
 use crate::manifest::ManifestFile;
 use crate::memtable::{MemTable, open_mem_tables};
 use crate::options::Options;
@@ -31,9 +38,9 @@ use crate::oracle::Oracle;
 use crate::structs::Entry;
 use crate::table::{TableOptions, new_block_cache, new_index_cache};
 use crate::txn::Txn;
-use crate::util::keys::parse_ts;
+use crate::util::keys::{key_with_ts, parse_ts};
 use crate::util::{OwnedValueStruct, sync_dir};
-use crate::vlog::ValueLog;
+use crate::vlog::{self, ValueLog};
 use crate::write::{self, FlushMsg, Request};
 
 /// Key prefix under which banned namespaces are stored.
@@ -48,6 +55,14 @@ pub struct DB {
     inner: Arc<DbInner>,
     writer: Option<JoinHandle<()>>,
     flusher: Option<JoinHandle<()>>,
+    /// `None` while stopped (and always in read-only mode).
+    compactors: Mutex<Option<Compactors>>,
+}
+
+/// The compactor threads; dropping `stop` tells them to exit.
+struct Compactors {
+    stop: Sender<()>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 /// Memtables: the one being written (none in read-only mode) and the
@@ -77,6 +92,8 @@ pub(crate) struct DbInner {
     /// Queue to the flush thread.
     pub flush_tx: Sender<FlushMsg>,
     pub block_writes: AtomicBool,
+    /// Set while a drop runs: flushes to L0 do not wait for compaction.
+    l0_stall_disabled: AtomicBool,
     banned_namespaces: RwLock<HashSet<u64>>,
     closed: AtomicBool,
     // Released last (fields drop in declaration order).
@@ -166,6 +183,7 @@ impl DB {
             write_tx: RwLock::new((!opt.read_only).then_some(write_tx)),
             flush_tx,
             block_writes: AtomicBool::new(opt.read_only),
+            l0_stall_disabled: AtomicBool::new(false),
             banned_namespaces: RwLock::new(HashSet::new()),
             closed: AtomicBool::new(false),
             _dir_locks: dir_locks,
@@ -176,9 +194,11 @@ impl DB {
             inner,
             writer: None,
             flusher: None,
+            compactors: Mutex::new(None),
         };
         if !db.inner.opt.read_only {
             db.start_threads(write_rx, flush_rx)?;
+            db.start_compactions()?;
             // Recovered memtables are flushed right away.
             for mt in imm_to_flush {
                 db.inner
@@ -214,6 +234,39 @@ impl DB {
             Box::new(move || write::write_loop(&inner, write_rx)),
         )?);
         Ok(())
+    }
+
+    /// Starts the compactor threads (Go's `startCompactions`).
+    fn start_compactions(&self) -> Result<()> {
+        let mut slot = self.compactors.lock().unwrap();
+        if slot.is_some() || self.inner.opt.read_only {
+            return Ok(());
+        }
+        let (stop, rx) = crossbeam_channel::bounded::<()>(0);
+        let mut handles = Vec::new();
+        for id in 0..self.inner.opt.num_compactors {
+            let inner = Arc::clone(&self.inner);
+            let rx = rx.clone();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("badger-compact-{id}"))
+                    .spawn(move || compaction::run_compactor(&inner, id as i32, rx))?,
+            );
+        }
+        *slot = Some(Compactors { stop, handles });
+        Ok(())
+    }
+
+    /// Stops the compactor threads, waiting for running compactions (Go's
+    /// `stopCompactions`).
+    fn stop_compactions(&self) {
+        let Some(c) = self.compactors.lock().unwrap().take() else {
+            return;
+        };
+        drop(c.stop);
+        for h in c.handles {
+            let _ = h.join();
+        }
     }
 
     /// Loads the banned namespaces stored under [`BANNED_NS_KEY`].
@@ -355,6 +408,279 @@ impl DB {
         Ok(())
     }
 
+    /// Size, target size and compaction score of every level (Go's
+    /// `Levels`).
+    pub fn levels(&self) -> Vec<LevelInfo> {
+        self.inner.lc.level_info(&self.inner.opt)
+    }
+
+    /// Verifies the checksum of every table (Go's `VerifyChecksum`), useful
+    /// when the DB was opened without checksum verification.
+    pub fn verify_checksum(&self) -> Result<()> {
+        self.inner.lc.verify_checksum()
+    }
+
+    /// Runs value log garbage collection once (Go's `RunValueLogGC`): if a
+    /// value log file has at least `discard_ratio` (in `(0, 1)`) of its data
+    /// discardable, its live values are written again and the file is
+    /// deleted. Fails with [`Error::NoRewrite`] when no file qualifies and
+    /// [`Error::Rejected`] while another GC runs. Call it repeatedly (while
+    /// it succeeds) to reclaim more.
+    pub fn run_value_log_gc(&self, discard_ratio: f64) -> Result<()> {
+        if self.inner.opt.in_memory {
+            return Err(Error::GcInMemoryMode);
+        }
+        if self.inner.opt.read_only {
+            return Err(Error::GcInReadOnlyMode);
+        }
+        if discard_ratio >= 1.0 || discard_ratio <= 0.0 {
+            return Err(Error::InvalidRequest);
+        }
+        self.check_open()?;
+        vlog::run_gc(&self.inner, discard_ratio)
+    }
+
+    /// Compacts until every table sits on one level, so all versions of a
+    /// key are together (Go's `Flatten`), using `workers` threads. Background
+    /// compactions pause meanwhile; avoid writing during it.
+    ///
+    /// # Panics
+    /// In read-only mode.
+    pub fn flatten(&self, workers: usize) -> Result<()> {
+        assert!(
+            !self.inner.opt.read_only,
+            "Cannot flatten in read-only mode."
+        );
+        self.stop_compactions();
+        let res = self.flatten_inner(workers.max(1));
+        let started = self.start_compactions();
+        res.and(started)
+    }
+
+    fn flatten_inner(&self, workers: usize) -> Result<()> {
+        let db = &*self.inner;
+        let compact_away = |cp: CompactionPriority| -> Result<()> {
+            log::info!("Attempting to compact with {cp:?}");
+            let results: Vec<Result<bool>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let cp = cp.clone();
+                        s.spawn(move || db.lc.do_compact(db, 175, cp))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut success = 0;
+            let mut last_err = None;
+            for r in results {
+                match r {
+                    Ok(true) => success += 1,
+                    Ok(false) => last_err = Some(fill_tables_error()),
+                    Err(e) => {
+                        log::warn!("While running doCompact with {cp:?}. Error: {e}");
+                        last_err = Some(e);
+                    }
+                }
+            }
+            if success == 0 {
+                return Err(last_err.unwrap_or_else(fill_tables_error));
+            }
+            log::info!(
+                "{success} compactor(s) succeeded. One or more tables from level {} compacted.",
+                cp.level
+            );
+            Ok(())
+        };
+        loop {
+            let levels: Vec<usize> = db
+                .lc
+                .levels
+                .iter()
+                .filter(|l| l.total_size() > 0)
+                .map(|l| l.level)
+                .collect();
+            if levels.len() <= 1 {
+                let prios = db.lc.pick_compact_levels(&db.opt);
+                match prios.into_iter().next() {
+                    Some(p) if p.score > 1.0 => compact_away(p)?,
+                    _ => {
+                        log::info!("All tables consolidated into one level. Flattening done.");
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
+            // A score above 1 forces the compaction; 1.71 marks it in logs.
+            compact_away(CompactionPriority::new(levels[0], 1.71))?;
+        }
+    }
+
+    /// Stops writes until the returned guard is dropped: queued writes are
+    /// applied and every full memtable is flushed (Go's `prepareToDrop`).
+    fn prepare_to_drop(&self) -> Result<DropGuard<'_>> {
+        assert!(
+            !self.inner.opt.read_only,
+            "Attempting to drop data in read-only mode."
+        );
+        self.inner.block_write()?;
+        let guard = DropGuard { db: &self.inner };
+        self.inner.l0_stall_disabled.store(true, Ordering::SeqCst);
+        self.inner.lc.signal_l0_drained();
+        let mut mem = self.inner.mem.lock().unwrap();
+        while !mem.imm.is_empty() {
+            mem = self.inner.flush_cond.wait(mem).unwrap();
+        }
+        Ok(guard)
+    }
+
+    /// Deletes all data (Go's `DropAll`): every table, value log file and
+    /// memtable. Writes and compactions pause meanwhile; do not read during
+    /// it (a read may fail).
+    ///
+    /// # Panics
+    /// In read-only mode.
+    pub fn drop_all(&self) -> Result<()> {
+        log::info!("DropAll called. Blocking writes...");
+        let _guard = self.prepare_to_drop()?;
+        self.stop_compactions();
+        let res = self.drop_all_inner();
+        let started = self.start_compactions();
+        res.and(started)
+    }
+
+    fn drop_all_inner(&self) -> Result<()> {
+        let db = &*self.inner;
+        let mut mem = db.mem.lock().unwrap();
+        if let Some(mt) = mem.mt.take() {
+            mt.delete_wal_on_drop();
+        }
+        for mt in mem.imm.drain(..) {
+            mt.delete_wal_on_drop();
+        }
+        let fid = mem.next_mem_fid;
+        mem.mt = Some(Arc::new(
+            MemTable::create(&db.opt, &db.registry, fid).context("cannot open new memtable")?,
+        ));
+        mem.next_mem_fid += 1;
+
+        let num = db.lc.drop_tree(db)?;
+        log::info!("Deleted {num} SSTables. Now deleting value logs...");
+        let num = db.vlog.drop_all()?;
+        log::info!("Deleted {num} value log files. DropAll done.");
+        if let Some(c) = &db.table_opts.block_cache {
+            c.clear();
+        }
+        if let Some(c) = &db.table_opts.index_cache {
+            c.clear();
+        }
+        Ok(())
+    }
+
+    /// Deletes every key starting with one of `prefixes` (Go's
+    /// `DropPrefix`). Writes and compactions pause meanwhile.
+    ///
+    /// # Panics
+    /// In read-only mode.
+    pub fn drop_prefix(&self, prefixes: &[&[u8]]) -> Result<()> {
+        if prefixes.is_empty() {
+            return Ok(());
+        }
+        log::info!("DropPrefix called for {prefixes:?}");
+        let _guard = self.prepare_to_drop()?;
+        let filtered = self.filter_prefixes_to_drop(prefixes)?;
+        if filtered.is_empty() {
+            log::info!("No prefixes to drop");
+            return Ok(());
+        }
+        let db = &*self.inner;
+        {
+            // Flush the memtable without the prefixes (the flush queue is
+            // empty and writes are blocked).
+            let mut mem = db.mem.lock().unwrap();
+            if let Some(mt) = mem.mt.take() {
+                if !mt.skiplist().is_empty()
+                    && let Err(e) = write::handle_memtable_flush(db, &mt, &filtered)
+                {
+                    log::error!("While trying to flush memtable: {e}");
+                    mem.mt = Some(mt);
+                    return Err(e);
+                }
+                mt.delete_wal_on_drop();
+            }
+            let fid = mem.next_mem_fid;
+            mem.mt = Some(Arc::new(
+                MemTable::create(&db.opt, &db.registry, fid)
+                    .context("cannot create new mem table")?,
+            ));
+            mem.next_mem_fid += 1;
+        }
+        self.stop_compactions();
+        let res = db.lc.drop_prefixes(db, &filtered);
+        let started = self.start_compactions();
+        res.and(started)?;
+        log::info!("DropPrefix done");
+        Ok(())
+    }
+
+    /// The prefixes that have at least one key.
+    fn filter_prefixes_to_drop(&self, prefixes: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
+        let mut filtered = Vec::new();
+        for &prefix in prefixes {
+            let found = self.view(|txn| {
+                let mut it = txn.iter(IteratorOptions {
+                    prefix: prefix.to_vec(),
+                    prefetch_values: false,
+                    ..Default::default()
+                });
+                it.rewind();
+                Ok(it.valid_for_prefix(prefix))
+            })?;
+            if found {
+                filtered.push(prefix.to_vec());
+            }
+        }
+        Ok(filtered)
+    }
+
+    /// Bans namespace `ns`: reads and writes of keys in it fail with
+    /// [`Error::BannedKey`] (Go's `BanNamespace`). Needs
+    /// `namespace_offset`.
+    ///
+    /// # Panics
+    /// In read-only mode.
+    pub fn ban_namespace(&self, ns: u64) -> Result<()> {
+        if self.inner.opt.namespace_offset.is_none() {
+            return Err(Error::NamespaceMode);
+        }
+        assert!(
+            !self.inner.opt.read_only,
+            "Cannot ban namespace in read-only mode."
+        );
+        log::info!("Banning namespace: {ns}");
+        // Stored first, then applied in memory.
+        let mut key = BANNED_NS_KEY.to_vec();
+        key.extend_from_slice(&ns.to_be_bytes());
+        let entry = Entry::new(key_with_ts(&key, 1), Vec::new());
+        let rx = self.inner.send_to_write_ch(vec![entry])?;
+        rx.recv().unwrap_or(Err(Error::DbClosed))?;
+        self.inner.banned_namespaces.write().unwrap().insert(ns);
+        Ok(())
+    }
+
+    /// The banned namespaces (Go's `BannedNamespaces`).
+    pub fn banned_namespaces(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .inner
+            .banned_namespaces
+            .read()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Closes the DB: waits for queued writes, flushes the memtable to L0,
     /// truncates the value log and releases the files and the directory
     /// lock. Dropping the DB does the same but cannot report errors.
@@ -373,6 +699,8 @@ impl DB {
             inner.block_writes.store(true, Ordering::SeqCst);
         }
         inner.flush_cond.notify_all();
+        // A flush stalled on L0 gives up waiting now.
+        inner.lc.signal_l0_drained();
         if inner.opt.read_only {
             return Ok(());
         }
@@ -400,8 +728,26 @@ impl DB {
             let _ = inner.flush_tx.send(None);
             let _ = t.join();
         }
+        self.stop_compactions();
+
+        // Nothing else runs now.
+        if inner.opt.compact_l0_on_close {
+            match inner
+                .lc
+                .do_compact(inner, 173, CompactionPriority::new(0, 1.73))
+            {
+                Ok(true) => log::debug!("Force compaction on level 0 done"),
+                // Nothing worth compacting.
+                Ok(false) => {}
+                Err(e) => log::warn!("While forcing compaction on level 0: {e}"),
+            }
+        }
 
         let mut result = inner.vlog.close().context("DB.Close");
+        log::info!(
+            "Lifetime L0 stalled for: {}ms",
+            inner.lc.l0_stalls_ms.load(Ordering::Relaxed)
+        );
         for dir in [&inner.opt.dir, &inner.opt.value_dir] {
             if !inner.opt.in_memory {
                 let r = sync_dir(dir).context("DB.Close");
@@ -508,6 +854,11 @@ impl DbInner {
         }
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         let gate = self.write_tx.read().unwrap();
+        // Checked again under the gate: `block_write` sets the flag and then
+        // takes the gate, so no request can slip in after its barrier.
+        if self.block_writes.load(Ordering::SeqCst) {
+            return Err(Error::BlockedWrites);
+        }
         let Some(tx) = gate.as_ref() else {
             return Err(Error::BlockedWrites);
         };
@@ -521,12 +872,65 @@ impl DbInner {
 }
 
 impl DbInner {
+    pub(crate) fn l0_stall_disabled(&self) -> bool {
+        self.l0_stall_disabled.load(Ordering::SeqCst)
+    }
+
+    /// Stops accepting writes and waits until every queued write is applied
+    /// (Go's `blockWrite`).
+    fn block_write(&self) -> Result<()> {
+        if self
+            .block_writes
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(Error::BlockedWrites);
+        }
+        // Wait out senders that passed the check, then push an empty request
+        // through the queue: once it is done, so is everything before it.
+        let tx = self.write_tx.write().unwrap().clone();
+        if let Some(tx) = tx {
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            if tx
+                .send(Request {
+                    entries: Vec::new(),
+                    done: done_tx,
+                })
+                .is_ok()
+            {
+                let _ = done_rx.recv();
+            }
+        }
+        log::info!("Writes flushed. Stopping compactions now...");
+        Ok(())
+    }
+
     /// Writes `entries` (keys with versions) as one batch and waits for it
     /// (Go's `batchSet`).
-    #[allow(dead_code)] // used by WriteBatch (Phase 7) and tests
     pub(crate) fn batch_set(&self, entries: Vec<Entry>) -> Result<()> {
         let rx = self.send_to_write_ch(entries)?;
         rx.recv().unwrap_or(Err(Error::DbClosed))
+    }
+}
+
+/// Go's `errFillTables`: a compaction found no tables to compact.
+fn fill_tables_error() -> Error {
+    Error::Context {
+        context: "Unable to fill tables".into(),
+        source: Box::new(Error::InvalidRequest),
+    }
+}
+
+/// Undoes `prepare_to_drop` when dropped: writes resume.
+struct DropGuard<'a> {
+    db: &'a DbInner,
+}
+
+impl Drop for DropGuard<'_> {
+    fn drop(&mut self) {
+        log::info!("Resuming writes");
+        self.db.l0_stall_disabled.store(false, Ordering::SeqCst);
+        self.db.block_writes.store(false, Ordering::SeqCst);
     }
 }
 
@@ -540,5 +944,9 @@ pub(crate) fn create_dirs(opt: &Options) -> Result<()> {
 }
 
 // Miri cannot mmap files.
+#[cfg(all(test, not(miri)))]
+mod compaction_tests;
+#[cfg(all(test, not(miri)))]
+mod gc_tests;
 #[cfg(all(test, not(miri)))]
 mod tests;

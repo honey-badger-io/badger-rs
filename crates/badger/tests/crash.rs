@@ -8,7 +8,9 @@
 //! - there are no gaps (commits are applied in order).
 //!
 //! This repeats on the same directory, so later rounds also recover from a
-//! crash during or right after an earlier recovery.
+//! crash during or right after an earlier recovery. Compaction runs, and the
+//! child rewrites older transactions with the same values and runs value log
+//! GC now and then, so kills also land in the middle of those.
 
 #![cfg(unix)]
 
@@ -27,7 +29,10 @@ fn options(dir: &Path) -> Options {
         .with_mem_table_size(64 << 10)
         .with_value_threshold(64)
         .with_value_log_file_size(1 << 20)
-        .with_num_compactors(0)
+        .with_base_table_size(32 << 10)
+        .with_base_level_size(128 << 10)
+        .with_num_level_zero_tables(2)
+        .with_num_compactors(2)
 }
 
 fn key(txn: u64, j: u64) -> Vec<u8> {
@@ -73,6 +78,21 @@ fn crash_child() {
         })
         .unwrap();
         println!("committed {n}");
+        // Garbage for compaction and GC: write an older transaction again,
+        // with the same values, so the checks do not change.
+        if n.is_multiple_of(3) {
+            let old = n / 2;
+            db.update(|txn| {
+                for j in 0..KEYS_PER_TXN {
+                    txn.set(key(old, j), value(old, j))?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        if n.is_multiple_of(200) {
+            while db.run_value_log_gc(0.2).is_ok() {}
+        }
         n += 1;
     }
 }

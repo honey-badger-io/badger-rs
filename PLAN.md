@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 5 done (2026-11-16). Next: Phase 6.
+**Status:** Phase 6 done (2026-11-18). Next: Phase 7.
 
 ## Decisions
 
@@ -280,7 +280,55 @@ Deviations and findings:
 - Rotating memtables, flushing to L0, writing manifest changes.
 - **Done when:** Rust writes a DB and the Go verifier accepts it; crash-in-the-middle tests (kill the child process) reopen consistently.
 
-### Phase 6: background work (`levels.go` compaction, `compaction.go`, `discard.go`, `value.go` GC)
+### Phase 6: background work (`levels.go` compaction, `compaction.go`, `discard.go`, `value.go` GC) (done)
+Result: `crates/badger/src/{compaction,discard}.rs`, plus compaction state in
+`levels.rs` and GC in `vlog.rs`. Compactor threads (dynamic level targets,
+Pebble-style score adjustment, L0 → Lbase / L0 → L0 / Li → Li+1 / Lmax → Lmax,
+parallel sub-compactions over key splits), L0 write stalls, the `DISCARD`
+file, `run_value_log_gc`, `flatten`, `drop_all`, `drop_prefix`,
+`ban_namespace`, `compact_l0_on_close`, `levels()` and `verify_checksum()`.
+Go's compaction tests from `levels_test.go`, the GC, discard and drop tests
+are ported (`src/db/{compaction,gc}_tests.rs`, `discard.rs`).
+`tests/workload.rs` runs 20,000 random operations per scenario (sets with
+inline and value-log values, deletes, expired entries, drop_prefix, one
+drop_all, GC, reopens) against a `BTreeMap` model while two reader threads
+check snapshots; `go-fixtures verify` accepts the result, plain and with
+zstd + AES (`make compat`, CI). The crash test now runs with compaction,
+rewrites and GC in the child.
+
+Deviations and findings:
+- **GC could resurrect deleted keys** (found by the workload test, present in
+  Go too): GC writes back the versions the LSM tree still points to, old ones
+  included. Such a copy lands *above* the delete that shadows it; once
+  compaction drops the delete and the original further down, the old value
+  is visible again. Go only guards against deletes committed during the
+  rewrite (`gcDiscardTs`). The port also writes the key's newest version
+  again right after the old one, so it stays shadowed
+  (`gc_write_back_does_not_resurrect_deleted_key`).
+- After GC, versions no read can see (expired ones, or old ones whose
+  written-back copy compaction dropped) may still be listed with a pointer
+  into a deleted file, so an all-versions iteration can fail to read their
+  values, as in Go. The workload uses inline values for expired entries and
+  flattens before dumping.
+- L0 → L0 compactions pick a contiguous run of L0 tables, and the output
+  takes their place: L0 stays in age order. Go may skip tables in the
+  middle and then sorts L0 by key, so a GC-rewritten copy could lose to the
+  older copy it replaced.
+- Blocking writes for a drop does not restart the writer and flush threads:
+  an empty request drains the writer (the `block_writes` flag is re-checked
+  under the write-channel gate), and the drop waits for the flush queue to
+  empty with L0 stalls disabled. `drop_all` keeps table ids increasing (Go
+  restarts at 1), so an open reader's old table can never share a file name
+  with a new one.
+- Removed tables are marked `delete_on_drop`; vlog files GC removes while no
+  iterator is open are deleted in place under their lock (later reads get an
+  error, never unmapped memory). Open iterators defer deletion, as in Go.
+- `DISCARD` slots are inserted in place, keeping them sorted (Go appends and
+  re-sorts every slot on each insert).
+- Sub-compactions run on scoped threads; each builds its tables itself (Go
+  starts a goroutine per table). Compactors stop through a dropped channel.
+- `vlog_percentile` (dynamic value threshold) is still not ported.
+
 - Compaction priorities, L0 → Lbase, dynamic level sizes, table splits, L0 stalls.
 - Discard stats file, `run_value_log_gc`, vlog file rewrite.
 - `flatten`, `drop_all`, `drop_prefix`, banned namespaces.

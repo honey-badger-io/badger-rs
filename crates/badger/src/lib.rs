@@ -23,14 +23,18 @@
 //! | `key_registry.go` | [`key_registry`] |
 //! | `manifest.go` | [`manifest`] |
 //! | `levels.go`, `level_handler.go` | `levels` (internal) |
-//! | `value.go` (value log) | [`vlog`] |
+//! | `compaction.go`, compaction in `levels.go` | `compaction` (internal) |
+//! | `value.go` (value log and GC) | [`vlog`] |
+//! | `discard.go` | `discard` (internal) |
 //! | `db.go`, `managed_db.go` | [`db`], `write` (internal: writer and flush threads) |
 //! | `txn.go` | [`txn`], `oracle` (internal) |
 //! | `iterator.go` | [`iterator`] |
 //! | `dir_unix.go` | [`dir_lock`] |
 
+mod compaction;
 pub mod db;
 pub mod dir_lock;
+mod discard;
 pub mod error;
 pub mod fb;
 pub mod iterator;
@@ -54,7 +58,7 @@ mod write;
 pub use db::DB;
 pub use error::{Error, Result};
 pub use iterator::{Item, Iterator, IteratorOptions};
-pub use levels::TableInfo;
+pub use levels::{LevelInfo, TableInfo};
 pub use options::Options;
 pub use structs::Entry;
 pub use txn::Txn;

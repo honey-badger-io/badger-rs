@@ -305,6 +305,14 @@ impl LogFile {
         self.mmap.delete()
     }
 
+    /// Removes the file while other threads may still hold this `LogFile`
+    /// (behind a lock): later reads find no data.
+    pub fn delete_in_place(&mut self) -> Result<()> {
+        self.size = 0;
+        self.write_at = 0;
+        self.mmap.delete_in_place()
+    }
+
     /// Syncs, unmaps and closes the file, optionally resizing it first.
     pub fn close(self, max_size: Option<u64>) -> Result<()> {
         self.mmap.close(max_size)
