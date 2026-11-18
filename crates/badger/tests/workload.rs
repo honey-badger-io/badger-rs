@@ -395,6 +395,14 @@ fn run(s: &Scenario, dir: &Path, ops: u64) -> (DbOptions, Model, Stats) {
     // meet and the stale ones go.
     d.flatten(2).unwrap();
     assert_same_db(&latest(&d), &model, "after flatten", Some(&d));
+    // Flattening dropped every shadowed and deleted version, so the discard
+    // stats are full now, however far background compaction had got: GC
+    // must find work. (After a flatten only live versions remain, so the
+    // values it writes back cannot go stale.)
+    while d.run_value_log_gc(0.1).is_ok() {
+        stats.gc_rewrites += 1;
+    }
+    assert_same_db(&latest(&d), &model, "after the last GC", Some(&d));
     d.close().unwrap();
     (o, model, stats)
 }
