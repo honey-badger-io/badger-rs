@@ -31,6 +31,7 @@
 //! | `iterator.go` | [`iterator`] |
 //! | `dir_unix.go` | [`dir_lock`] |
 
+pub mod backup;
 pub mod batch;
 mod compaction;
 pub mod db;
@@ -59,6 +60,7 @@ pub mod util;
 pub mod vlog;
 mod write;
 
+pub use backup::KvLoader;
 pub use batch::WriteBatch;
 pub use db::DB;
 pub use error::{Error, Result};

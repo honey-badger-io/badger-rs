@@ -39,6 +39,7 @@ compat: go-fixtures
 	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test table_compat builds_every
 	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test write_compat
 	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test workload
+	BADGER_COMPAT_OUT=$(abspath $(COMPAT_OUT)) cargo test -p badger --test backup_compat
 	for json in $(COMPAT_OUT)/sst/*.json; do \
 		name=$$(basename $$json .json); \
 		$(GO_FIXTURES)/go-fixtures verify-sst $(COMPAT_OUT)/sst/$$name/000001.sst $$json || exit 1; \
@@ -46,6 +47,10 @@ compat: go-fixtures
 	for json in $(COMPAT_OUT)/db/*.json; do \
 		name=$$(basename $$json .json); \
 		$(GO_FIXTURES)/go-fixtures verify $(COMPAT_OUT)/db/$$name $$json || exit 1; \
+	done
+	for json in $(COMPAT_OUT)/backup/*.json; do \
+		name=$$(basename $$json .json); \
+		$(GO_FIXTURES)/go-fixtures verify-backup $(COMPAT_OUT)/backup/$$name.bak $$json || exit 1; \
 	done
 
 ## verify: check a DB with Go Badger, e.g. make verify DB=/tmp/db EXPECTED=/tmp/db.json

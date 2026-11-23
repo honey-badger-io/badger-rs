@@ -10,6 +10,11 @@
 //	                                          and compare it to <expected.json>
 //	go-fixtures verify-sst <file.sst> <expected.json>
 //	                                          open a table with Go Badger and compare it
+//	go-fixtures backup <db-dir> <expected.json> <out.bak>
+//	                                          write a full Go backup of a DB
+//	go-fixtures verify-backup <file.bak> <expected.json>
+//	                                          load a backup into a fresh DB and compare
+//	                                          its latest entries with the source DB's
 //
 // The JSON formats are documented in ../README.md and mirrored by the
 // `badger-fixtures` Rust crate.
@@ -26,6 +31,8 @@ const usage = `usage:
   go-fixtures dump <db-dir> [expected-or-options.json]
   go-fixtures verify <db-dir> <expected.json>
   go-fixtures verify-sst <file.sst> <expected.json>
+  go-fixtures backup <db-dir> <expected.json> <out.bak>
+  go-fixtures verify-backup <file.bak> <expected.json>
 `
 
 func main() {
@@ -66,6 +73,16 @@ func run(args []string) error {
 			return fmt.Errorf("verify-sst takes exactly two arguments\n%s", usage)
 		}
 		return verifySSTCmd(rest[0], rest[1])
+	case "backup":
+		if len(rest) != 3 {
+			return fmt.Errorf("backup takes exactly three arguments\n%s", usage)
+		}
+		return backupCmd(rest[0], rest[1], rest[2])
+	case "verify-backup":
+		if len(rest) != 2 {
+			return fmt.Errorf("verify-backup takes exactly two arguments\n%s", usage)
+		}
+		return verifyBackupCmd(rest[0], rest[1])
 	default:
 		return fmt.Errorf("unknown command %q\n%s", cmd, usage)
 	}

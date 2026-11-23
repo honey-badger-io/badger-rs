@@ -11,6 +11,8 @@ make golden                                  # regenerate compat/golden/phase1.j
 make verify DB=/path/to/db EXPECTED=x.json   # Go opens DB read-only and compares
 make compat                                  # Rust builds tables; Go checks them (verify-sst)
 cd go-fixtures && go run . dump <db-dir> [expected.json]   # print contents as JSON
+cd go-fixtures && go run . backup <db-dir> <expected.json> <out.bak>   # write a Go backup
+cd go-fixtures && go run . verify-backup <file.bak> <expected.json>    # Go loads a backup and compares
 ```
 
 The Rust side reads them through the `badger-fixtures` crate
@@ -49,7 +51,14 @@ fixtures/
   db/<name>.json        expected contents of that DB
   sst/<name>/000001.sst a standalone table built with Go's table.Builder
   sst/<name>.json       the entries it was built from, plus table metadata
+  backup/<name>.bak     a full Go backup (DB.Backup) of db/<name>, for basic,
+                        vlog, versions and managed; regenerated with the DB
 ```
+
+Backups are compared by their latest visible entries: loading one into a
+fresh DB must give the newest non-deleted, non-expired version of every key
+in the source's JSON (`verify-backup` in Go, `tests/backup_compat.rs` in
+Rust).
 
 ### DB fixtures
 

@@ -82,6 +82,12 @@ func generate(out string, names ...string) error {
 		}
 		idx.Fixtures = append(idx.Fixtures, e)
 		fmt.Printf("db  %-20s %s\n", s.name, s.desc)
+		if backupFixtures[s.name] {
+			if err := genBackup(out, e); err != nil {
+				return fmt.Errorf("backup of %s: %w", s.name, err)
+			}
+			fmt.Printf("bak %-20s Go backup of the db fixture\n", s.name)
+		}
 	}
 	for i, s := range sstScenarios() {
 		if e, ok := keep("sst", s.name); ok {
@@ -119,12 +125,26 @@ func prepareOutDir(out string) error {
 	if _, err := os.Stat(filepath.Join(out, "index.json")); err != nil {
 		return fmt.Errorf("%w: %s (no index.json)", errNotFixtureDir, out)
 	}
-	for _, name := range []string{"db", "sst", "index.json"} {
+	for _, name := range []string{"db", "sst", "backup", "index.json"} {
 		if err := os.RemoveAll(filepath.Join(out, name)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// backupFixtures are the DB fixtures that also get a Go backup, in
+// backup/<name>.bak.
+var backupFixtures = map[string]bool{"basic": true, "vlog": true, "versions": true, "managed": true}
+
+// genBackup writes a full Go backup of the DB fixture e.
+func genBackup(out string, e IndexEntry) error {
+	dir := filepath.Join(out, "backup")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return backupCmd(filepath.Join(out, e.Path), filepath.Join(out, e.Expected),
+		filepath.Join(dir, e.Name+".bak"))
 }
 
 // ---------------------------------------------------------------------------

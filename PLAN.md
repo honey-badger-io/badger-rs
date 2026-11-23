@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator, iterator prefetch, Stream and StreamWriter done.
+**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator, iterator prefetch, Stream, StreamWriter and backup/load done.
 
 ## Decisions
 
@@ -343,8 +343,10 @@ remaining iterator tests of `iterator_test.go`, `db_test.go` and
 (`src/stream.rs`, `stream_test.go` ported, the manual big-stream tests at a
 smaller size); StreamWriter (`src/stream_writer.rs`,
 `stream_writer_test.go` ported; `tests/write_compat.rs` copies a DB with
-Stream → StreamWriter and Go verifies the copy). Next: backup/load,
-Subscribe, key rotation.
+Stream → StreamWriter and Go verifies the copy); backup/load
+(`src/backup.rs`, `backup_test.go` ported; `tests/backup_compat.rs` loads
+Go's backups of fixture DBs, committed in `compat/fixtures/backup`, and Go
+loads Rust's in `make compat`). Next: Subscribe, key rotation.
 
 Deviations and findings so far:
 - `Txn::start_commit` returns a `PendingCommit` (wait for the result with
@@ -391,6 +393,10 @@ Deviations and findings so far:
   in place (only ever forward) instead of replacing it.
   `prepare_incremental` on a DB with only L0 data flattens it and writes
   above the level the data landed on (Go assumes the last level).
+- `DB::load` keeps at most `max_pending_writes` batches in flight by
+  waiting on the oldest (Go: `y.Throttle`), and advances the oracle once
+  at the end. A backup cut short is an error (`InvalidDump` for a partial
+  length prefix).
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).
