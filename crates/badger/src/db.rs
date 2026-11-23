@@ -961,4 +961,6 @@ mod compaction_tests;
 #[cfg(all(test, not(miri)))]
 mod gc_tests;
 #[cfg(all(test, not(miri)))]
+mod iterator_tests;
+#[cfg(all(test, not(miri)))]
 mod tests;

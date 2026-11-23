@@ -128,6 +128,7 @@ impl<'db> Txn<'db> {
                     expires_at: e.expires_at,
                     meta: e.meta,
                     user_meta: e.user_meta,
+                    val: None,
                     db: self.db,
                 });
             }
@@ -151,6 +152,7 @@ impl<'db> Txn<'db> {
             expires_at: vs.expires_at,
             meta: vs.meta,
             user_meta: vs.user_meta,
+            val: None,
             db: self.db,
         })
     }

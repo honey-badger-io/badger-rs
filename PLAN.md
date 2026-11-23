@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch` and the merge operator done.
+**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator and iterator prefetch done.
 
 ## Decisions
 
@@ -337,7 +337,9 @@ Deviations and findings:
 ### Phase 7: remaining features
 Progress: `WriteBatch` (`src/batch.rs`, Go's `batch_test.go` and the
 write batch tests of `managed_db_test.go` ported); merge operator
-(`src/merge.rs`, `merge_test.go` ported). Next: iterator prefetch, Stream,
+(`src/merge.rs`, `merge_test.go` ported); iterator value prefetching (the
+remaining iterator tests of `iterator_test.go`, `db_test.go` and
+`txn_test.go` ported, in `src/db/iterator_tests.rs`). Next: Stream,
 StreamWriter, backup/load, Subscribe, key rotation.
 
 Deviations and findings so far:
@@ -361,6 +363,13 @@ Deviations and findings so far:
   in the DB once `stop` returns (Go's `batchSetAsync` does not wait).
   `get_merge_operator` panics on a managed DB (Go's goroutine panics on its
   first merge instead).
+- Prefetching reads ahead in batches: the iterator keeps up to
+  `prefetch_size` items buffered and, when half are used, refills and
+  copies the new items' value log values, on up to 8 scoped threads for
+  batches of 16+ reads (Go starts a goroutine per item). A failed prefetch
+  is silent; `Item::value` reads again and returns the error (Go logs it
+  and returns an empty value). Without `prefetch_values` the buffer holds
+  one item and values are read on demand.
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).
