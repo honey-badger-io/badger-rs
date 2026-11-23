@@ -13,8 +13,10 @@
 //!   is closed.
 //! - Matching happens on the writer thread (only when there are
 //!   subscribers), and only matching KVs are queued; Go queues whole
-//!   requests to the publisher goroutine. The queue sizes are Go's: a slow
-//!   subscriber eventually blocks writes, as in Go.
+//!   requests to the publisher goroutine. The queue sizes are Go's, but a
+//!   subscriber that falls a full queue behind is dropped instead of
+//!   blocking the publisher (and so every write and `close`): its
+//!   [`Subscription`] ends, and [`Subscription::fell_behind`] tells why.
 //! - As in Go, a KV's `meta` holds the entry's *user* meta, and deletes are
 //!   published as KVs with an empty value.
 
@@ -23,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 
 use crate::db::DB;
 use crate::error::{Error, Result, ResultExt};
@@ -43,6 +45,8 @@ struct Subscriber {
     tx: Sender<pb::KvList>,
     /// Cleared when the subscription is dropped: stop sending to it.
     active: Arc<AtomicBool>,
+    /// Set when it was dropped for falling behind.
+    lagged: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -129,23 +133,28 @@ impl Publisher {
 /// closes, then ends every subscription (Go's `listenForUpdates`).
 pub(crate) fn publish_loop(registry: &Registry, rx: Receiver<Updates>) {
     for updates in rx.iter() {
-        // Senders are cloned out of the lock: a full subscriber must not
-        // block subscribing or unsubscribing.
-        let targets: Vec<(Sender<pb::KvList>, Arc<AtomicBool>, pb::KvList)> = {
-            let state = registry.state.lock().unwrap();
-            updates
-                .into_iter()
-                .filter_map(|(id, list)| {
-                    state
-                        .subscribers
-                        .get(&id)
-                        .map(|s| (s.tx.clone(), Arc::clone(&s.active), list))
-                })
-                .collect()
-        };
-        for (tx, active, list) in targets {
-            if active.load(Ordering::SeqCst) {
-                let _ = tx.send(list);
+        let mut state = registry.state.lock().unwrap();
+        for (id, list) in updates {
+            let Some(s) = state.subscribers.get(&id) else {
+                continue;
+            };
+            if !s.active.load(Ordering::SeqCst) {
+                continue;
+            }
+            // Never block on a subscriber: one that is not reading would
+            // stall every write and `DB::close`.
+            match s.tx.try_send(list) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                Err(TrySendError::Full(_)) => {
+                    log::warn!("Subscriber {id} fell behind; dropping it");
+                    s.lagged.store(true, Ordering::SeqCst);
+                    s.active.store(false, Ordering::SeqCst);
+                    // Dropping its sender ends the subscription once drained.
+                    let s = state.subscribers.remove(&id).unwrap();
+                    for m in &s.matches {
+                        let _ = state.indexer.delete_match(m, id);
+                    }
+                }
             }
         }
     }
@@ -167,6 +176,7 @@ impl DB {
         let registry = &self.inner.publisher.registry;
         let (tx, rx) = crossbeam_channel::bounded(QUEUE_CAPACITY);
         let active = Arc::new(AtomicBool::new(true));
+        let lagged = Arc::new(AtomicBool::new(false));
         let mut state = registry.state.lock().unwrap();
         if registry.closed.load(Ordering::SeqCst) {
             return Err(Error::DbClosed);
@@ -188,12 +198,14 @@ impl DB {
                 matches: matches.to_vec(),
                 tx,
                 active: Arc::clone(&active),
+                lagged: Arc::clone(&lagged),
             },
         );
         Ok(Subscription {
             id,
             rx,
             active,
+            lagged,
             registry: Arc::clone(registry),
         })
     }
@@ -205,20 +217,22 @@ pub struct Subscription {
     id: u64,
     rx: Receiver<pb::KvList>,
     active: Arc<AtomicBool>,
+    lagged: Arc<AtomicBool>,
     registry: Arc<Registry>,
 }
 
 impl Subscription {
     /// Waits for updates and returns everything queued so far as one list
-    /// (Go's `slurp`). `None` once the DB is closed and all updates were
-    /// received.
+    /// (Go's `slurp`). `None` once the DB is closed, or the subscriber was
+    /// dropped for falling behind, and all updates were received.
     pub fn recv(&self) -> Option<pb::KvList> {
         let first = self.rx.recv().ok()?;
         Some(self.slurp(first))
     }
 
     /// Like [`Subscription::recv`], but gives up after `timeout`. `None` on
-    /// timeout or once the DB is closed (see [`Subscription::is_closed`]).
+    /// timeout or once the subscription ended (see
+    /// [`Subscription::is_closed`]).
     pub fn recv_timeout(&self, timeout: Duration) -> Option<pb::KvList> {
         match self.rx.recv_timeout(timeout) {
             Ok(first) => Some(self.slurp(first)),
@@ -226,9 +240,16 @@ impl Subscription {
         }
     }
 
-    /// Whether the DB closed and every update was received.
+    /// Whether the subscription ended (the DB closed, or it fell behind)
+    /// and every update was received.
     pub fn is_closed(&self) -> bool {
-        self.registry.closed.load(Ordering::SeqCst) && self.rx.is_empty()
+        (self.registry.closed.load(Ordering::SeqCst) || self.fell_behind()) && self.rx.is_empty()
+    }
+
+    /// Whether the subscription was ended because its queue filled up (it
+    /// was not read fast enough); later writes were not delivered.
+    pub fn fell_behind(&self) -> bool {
+        self.lagged.load(Ordering::SeqCst)
     }
 
     fn slurp(&self, mut batch: pb::KvList) -> pb::KvList {

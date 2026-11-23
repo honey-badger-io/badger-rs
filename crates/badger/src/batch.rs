@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::db::{DB, DbInner};
 use crate::error::{Error, Result, ResultExt};
 use crate::pb;
-use crate::structs::{BIT_DELETE, Entry};
+use crate::structs::{BIT_DELETE, BIT_DISCARD_EARLIER_VERSIONS, Entry};
 use crate::txn::{ModifyError, PendingCommit, Txn};
 
 /// Go's default for `SetMaxPendingTxns`.
@@ -154,7 +154,11 @@ impl<'db> WriteBatch<'db> {
     }
 
     /// Writes a list of key-value pairs, each at its own version (Go's
-    /// `WriteList`, used by streams).
+    /// `WriteList`, used by streams). Unlike Go, it keeps each pair's
+    /// `expires_at`, and the delete and discard-earlier-versions bits of
+    /// its `meta`, which holds the internal meta as in streams and backups
+    /// (not the user meta, as in [`DB::subscribe`](crate::DB::subscribe)'s
+    /// lists).
     ///
     /// # Panics
     /// If a pair has version 0.
@@ -171,6 +175,9 @@ impl<'db> WriteBatch<'db> {
             key: kv.key.clone(),
             value: kv.value.clone(),
             user_meta: kv.user_meta.first().copied().unwrap_or(0),
+            meta: kv.meta.first().copied().unwrap_or(0)
+                & (BIT_DELETE | BIT_DISCARD_EARLIER_VERSIONS),
+            expires_at: kv.expires_at,
             version: kv.version,
             ..Default::default()
         })

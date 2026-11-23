@@ -104,6 +104,14 @@ fn rotate_needs_a_closed_db() {
 }
 
 #[test]
+fn rotate_needs_a_key_registry() {
+    // A wrong directory must not look like a successful rotation.
+    let dir = tempfile::tempdir().unwrap();
+    assert!(rotate_master_key(dir.path(), &key(7), &key(8)).is_err());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn data_keys_rotate_by_age() {
     // A zero rotation period: every new table gets a fresh data key. All of
     // them stay readable, after reopening and after a master key rotation.

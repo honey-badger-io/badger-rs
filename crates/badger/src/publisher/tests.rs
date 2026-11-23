@@ -197,3 +197,23 @@ fn subscribe_after_close_fails_and_read_only_dbs_close() {
     assert!(sub.recv().is_none());
     assert!(sub.is_closed());
 }
+
+#[test]
+fn unread_subscriber_is_dropped_instead_of_blocking() {
+    // A held subscription nobody reads must not hang writes or close.
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(Options::new(dir.path())).unwrap();
+    let sub = db.subscribe(&[prefix("ke")]).unwrap();
+    for i in 0..2500 {
+        db.update(|txn| txn.set(format!("key{i}"), "v")).unwrap();
+    }
+    db.close().unwrap();
+    assert!(sub.fell_behind());
+    // What was queued before it fell behind is still delivered, then it ends.
+    let mut n = 0;
+    while let Some(list) = sub.recv() {
+        n += list.kv.len();
+    }
+    assert!(n > 0 && n < 2500, "{n}");
+    assert!(sub.is_closed());
+}

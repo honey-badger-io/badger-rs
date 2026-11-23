@@ -12,7 +12,8 @@
 //!   `max_pending_writes` batches in flight by waiting on the oldest
 //!   instead of a `y.Throttle`.
 //! - After loading, the oracle is advanced in place (Go assigns
-//!   `nextTxnTs` while reading and marks it done at the end).
+//!   `nextTxnTs` while reading and marks it done at the end), also when
+//!   loading fails partway.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
@@ -52,25 +53,12 @@ impl DB {
         let mut r = io::BufReader::with_capacity(16 << 10, r);
         let mut loader = self.new_kv_loader(max_pending_writes);
         let mut max_version = 0;
-        let mut buf = Vec::new();
-        loop {
-            let mut len = [0u8; 8];
-            if !read_exact_or_eof(&mut r, &mut len)? {
-                break;
-            }
-            let len = u64::from_le_bytes(len) as usize;
-            buf.resize(len, 0);
-            r.read_exact(&mut buf).context("while reading a backup")?;
-            let list = pb::KvList::decode(buf.as_slice())?;
-            for kv in &list.kv {
-                loader.set(kv)?;
-                max_version = max_version.max(kv.version);
-            }
-        }
-        loader.finish()?;
-        // New commits get bigger timestamps than every loaded version.
+        let read = read_backup(&mut r, &mut loader, &mut max_version);
+        // Even after an error: wait for the batches already sent, then make
+        // new commits get bigger timestamps than every version written.
+        let finished = loader.finish();
         self.inner.orc.advance_to(max_version);
-        Ok(())
+        read.and(finished)
     }
 
     /// A loader for writing many KVs at their own versions (Go's
@@ -83,6 +71,35 @@ impl DB {
             entries: Vec::new(),
             entries_size: 0,
             total_size: 0,
+        }
+    }
+}
+
+/// Feeds every KV of a backup to `loader`, tracking the newest version
+/// handed to it in `max_version`.
+fn read_backup(r: &mut impl Read, loader: &mut KvLoader<'_>, max_version: &mut u64) -> Result<()> {
+    let mut buf = Vec::new();
+    loop {
+        let mut len = [0u8; 8];
+        if !read_exact_or_eof(r, &mut len)? {
+            return Ok(());
+        }
+        let len = u64::from_le_bytes(len);
+        // Grow the buffer only as data arrives: a corrupt length must not
+        // allocate (and abort on) an arbitrary amount of memory up front.
+        buf.clear();
+        let n = r
+            .by_ref()
+            .take(len)
+            .read_to_end(&mut buf)
+            .context("while reading a backup")?;
+        if n as u64 != len {
+            return Err(Error::InvalidDump).context("backup ends in the middle of a list");
+        }
+        let list = pb::KvList::decode(buf.as_slice())?;
+        for kv in &list.kv {
+            *max_version = (*max_version).max(kv.version);
+            loader.set(kv)?;
         }
     }
 }

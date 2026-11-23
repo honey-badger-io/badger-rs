@@ -320,3 +320,52 @@ fn load_rejects_truncated_backup() {
     db2.close().unwrap();
     db.close().unwrap();
 }
+
+#[test]
+fn failed_load_still_advances_the_oracle() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(test_options(dir.path())).unwrap();
+    for i in 0..20 {
+        db.update(|txn| txn.set(format!("key{i}"), vec![1]))
+            .unwrap();
+    }
+    let mut bak = Vec::new();
+    let max_version = db.backup(&mut bak, 0).unwrap();
+    assert_eq!(max_version, 20);
+    // A list that does not decode follows the good ones.
+    bak.extend_from_slice(&5u64.to_le_bytes());
+    bak.extend_from_slice(&[0xff; 5]);
+    let other = tempfile::tempdir().unwrap();
+    let db2 = DB::open(test_options(other.path())).unwrap();
+    assert!(db2.load(bak.as_slice(), 16).is_err());
+    // The KVs written before the error are below every new commit.
+    assert!(next_ts(&db2) > max_version);
+    db2.close().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn load_rejects_huge_length_prefix() {
+    // Must fail cleanly, not try to allocate the claimed size.
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(test_options(dir.path())).unwrap();
+    let mut bak = u64::MAX.to_le_bytes().to_vec();
+    bak.extend_from_slice(&[0; 16]);
+    assert!(db.load(bak.as_slice(), 16).is_err());
+    db.close().unwrap();
+}
+
+#[test]
+fn backup_fails_on_versions_below_since() {
+    // Without since_ts, every key is older than `since`: the backup must fail,
+    // not silently leave them out.
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(test_options(dir.path())).unwrap();
+    populate(&db, 10);
+    let mut stream = db.new_stream();
+    let mut bak = Vec::new();
+    let err = stream.backup(&mut bak, 5).unwrap_err();
+    assert!(matches!(err.root(), Error::InvalidRequest), "{err}");
+    drop(stream);
+    db.close().unwrap();
+}

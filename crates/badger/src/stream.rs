@@ -27,7 +27,7 @@ use crossbeam_channel::RecvTimeoutError;
 use prost::Message;
 
 use crate::db::{DB, DbInner};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultExt};
 use crate::iterator::{Item, Iterator, IteratorOptions};
 use crate::pb;
 use crate::txn::Txn;
@@ -292,10 +292,11 @@ impl<'db> Stream<'db> {
                 Some(f) => f(&key, &mut it, thread_id),
                 None => to_list(self.db, &key, &mut it),
             };
-            match list {
-                Ok(list) => add(&mut batch, list)?,
-                Err(e) => log::warn!("While reading key: {}, got error: {e}", hex(&key)),
-            }
+            // Unlike Go, which logs and skips the key: a skipped key would
+            // silently leave it out of e.g. a backup that still succeeds.
+            let list = list
+                .with_context(|| format!("{} While reading key: {}", self.log_prefix, hex(&key)))?;
+            add(&mut batch, list)?;
         }
         if let Some(finish) = &self.finish_thread {
             add(&mut batch, finish(thread_id)?)?;

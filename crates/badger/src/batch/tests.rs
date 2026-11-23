@@ -373,3 +373,45 @@ fn drop_all_during_write_batch() {
         db.view(|txn| txn.get(b"after").map(|_| ())).unwrap();
     });
 }
+
+#[test]
+fn write_list_keeps_expiry_and_delete_bits() {
+    use crate::pb;
+    use crate::structs::BIT_DELETE;
+    with_db(test_options, true, |db| {
+        let expires_at = 4_000_000_000; // far in the future
+        let list = pb::KvList {
+            kv: vec![
+                pb::Kv {
+                    key: b"ttl".to_vec(),
+                    value: b"v".to_vec(),
+                    version: 3,
+                    expires_at,
+                    ..Default::default()
+                },
+                pb::Kv {
+                    key: b"gone".to_vec(),
+                    value: b"v".to_vec(),
+                    version: 2,
+                    ..Default::default()
+                },
+                pb::Kv {
+                    key: b"gone".to_vec(),
+                    version: 3,
+                    meta: vec![BIT_DELETE],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut wb = db.new_managed_write_batch();
+        wb.write_list(&list).unwrap();
+        wb.flush().unwrap();
+        db.view(|txn| {
+            assert_eq!(txn.get(b"ttl")?.expires_at(), expires_at);
+            assert!(matches!(txn.get(b"gone"), Err(Error::KeyNotFound)));
+            Ok(())
+        })
+        .unwrap();
+    });
+}

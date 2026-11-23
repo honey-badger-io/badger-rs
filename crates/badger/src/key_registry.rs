@@ -213,8 +213,15 @@ impl KeyRegistry {
 /// encrypted yet, an empty `new_key` stores the data keys unencrypted.
 /// Fails with [`Error::EncryptionKeyMismatch`] if `old_key` is wrong.
 ///
-/// Unlike Go, it takes the directory lock: the DB must not be open.
+/// Unlike Go, it takes the directory lock: the DB must not be open, and it
+/// fails if `dir` has no key registry.
 pub fn rotate_master_key(dir: &Path, old_key: &[u8], new_key: &[u8]) -> Result<()> {
+    // Opening would create an empty registry: a mistyped directory must not
+    // look like a successful rotation.
+    if !dir.join(KEY_REGISTRY_FILE_NAME).is_file() {
+        return Err(Error::InvalidRequest)
+            .with_context(|| format!("no {KEY_REGISTRY_FILE_NAME} in {}", dir.display()));
+    }
     let _lock = crate::dir_lock::DirLockGuard::acquire(dir, false)?;
     let mut opt = KeyRegistryOptions {
         dir: dir.to_path_buf(),
