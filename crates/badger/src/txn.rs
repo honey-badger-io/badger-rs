@@ -332,6 +332,8 @@ impl<'db> Txn<'db> {
         let Some(commit_ts) = orc.new_commit_ts(&req, &mut self.done_read) else {
             return Err(Error::Conflict);
         };
+        // Marks the commit done when dropped, on every path from here on.
+        let commit_mark = orc.commit_mark(commit_ts);
 
         // Entries without an explicit version (all of them, outside managed
         // mode) get the commit timestamp and are marked as one transaction.
@@ -361,13 +363,7 @@ impl<'db> Txn<'db> {
                 ..Default::default()
             });
         }
-        match self.db.send_commit_to_write_ch(entries, commit_ts) {
-            Ok(rx) => Ok(rx),
-            Err(e) => {
-                orc.done_commit(commit_ts);
-                Err(e)
-            }
-        }
+        self.db.send_commit_to_write_ch(entries, commit_mark)
     }
 }
 

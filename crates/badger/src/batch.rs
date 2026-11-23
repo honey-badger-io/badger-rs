@@ -11,7 +11,10 @@
 //! - [`WriteBatch::flush`] consumes the batch and dropping it cancels it, so
 //!   "flush after flush/cancel" (`ErrCommitAfterFinish`) cannot happen.
 //! - In-flight commits are [`PendingCommit`]s waited on in order instead of
-//!   callbacks counted by a `y.Throttle`.
+//!   callbacks counted by a `y.Throttle`. Once an error is seen, nothing
+//!   more is committed (Go may still commit one more transaction).
+//! - [`WriteBatch::flush`] waits for every commit in flight even when its
+//!   own commit fails (Go returns at once, leaving them running).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -222,6 +225,8 @@ impl<'db> WriteBatch<'db> {
             let res = self.pending.pop_front().unwrap().wait();
             self.record(res);
         }
+        // An earlier commit may have failed meanwhile.
+        self.check_err()?;
         let txn = self.txn.take().expect("write batch has a transaction");
         let started = txn.start_commit();
         self.txn = Some(self.new_txn());

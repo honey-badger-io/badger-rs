@@ -2,6 +2,8 @@
 //! `managed_db_test.go`.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use crate::iterator::IteratorOptions;
 use crate::{DB, Entry, Error, Options};
@@ -59,10 +61,35 @@ fn check_range(db: &DB, m: usize, n: usize, version: Option<u64>) {
     .unwrap();
 }
 
+/// Every commit so far is marked done (a new read would not wait) and no
+/// read is left open (the read mark catches up with a fresh read).
+fn assert_marks_settled(db: &DB) {
+    let orc = &db.inner.orc;
+    let last = orc.next_ts() - 1;
+    let wait = Duration::from_secs(5);
+    assert!(
+        orc.txn_mark.wait_for_mark_timeout(last, wait),
+        "commit marks"
+    );
+    db.view(|_| Ok(())).unwrap();
+    assert!(
+        orc.read_mark.wait_for_mark_timeout(last, wait),
+        "read marks"
+    );
+}
+
 #[test]
 fn write_batch() {
+    // One commit in flight at a time, and Go's default of 16.
+    for max_pending in [1, 16] {
+        write_batch_with(max_pending);
+    }
+}
+
+fn write_batch_with(max_pending: usize) {
     with_db(test_options, false, |db| {
         let mut wb = db.new_write_batch();
+        wb.set_max_pending_txns(max_pending);
         // SetEntryAt needs managed mode.
         assert!(wb.set_entry_at(Entry::default(), 12).is_err());
         let (n, m) = (50_000, 1000);
@@ -73,6 +100,7 @@ fn write_batch() {
             wb.delete(key(i)).unwrap();
         }
         wb.flush().unwrap();
+        assert_marks_settled(db);
         check_range(db, m, n, None);
     });
 }
@@ -235,6 +263,7 @@ fn dropping_a_batch_discards_uncommitted_writes() {
         let mut wb = db.new_write_batch();
         wb.set("a", "1").unwrap();
         drop(wb);
+        assert_marks_settled(db);
         db.view(|txn| {
             assert!(matches!(txn.get(b"a"), Err(Error::KeyNotFound)));
             Ok(())
@@ -264,5 +293,83 @@ fn start_commit_then_read() {
         for p in txns {
             p.wait().unwrap();
         }
+    });
+}
+
+#[test]
+fn failed_send_marks_commit_done() {
+    // The commit mark of a transaction whose writes cannot be queued is
+    // released: later transactions do not wait for it.
+    with_db(test_options, false, |db| {
+        db.inner.block_writes.store(true, Ordering::SeqCst);
+        let mut txn = db.new_transaction(true);
+        txn.set("a", "1").unwrap();
+        assert!(matches!(
+            txn.start_commit().map(|_| ()).unwrap_err().root(),
+            Error::BlockedWrites
+        ));
+        db.inner.block_writes.store(false, Ordering::SeqCst);
+        assert_marks_settled(db);
+        db.update(|txn| txn.set("b", "2")).unwrap();
+    });
+}
+
+#[test]
+fn write_list_non_managed() {
+    // Explicit versions: no transaction markers, but the oracle's commit
+    // timestamp is still marked done.
+    with_db(test_options, false, |db| {
+        let mut wb = db.new_write_batch();
+        let list = crate::pb::KvList {
+            kv: vec![crate::pb::Kv {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+                user_meta: vec![7],
+                version: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        wb.write_list(&list).unwrap();
+        wb.flush().unwrap();
+        assert_marks_settled(db);
+        db.view(|txn| {
+            let item = txn.get(b"k").unwrap();
+            assert_eq!(item.version(), 1);
+            assert_eq!(item.user_meta(), 7);
+            assert_eq!(item.value_copy().unwrap(), b"v");
+            Ok(())
+        })
+        .unwrap();
+    });
+}
+
+#[test]
+fn drop_all_during_write_batch() {
+    // Writes racing a drop_all either land or fail with BlockedWrites; the
+    // batch never hangs, and afterwards the DB takes writes again.
+    with_db(test_options, false, |db| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(5));
+                db.drop_all().unwrap();
+            });
+            let mut wb = db.new_write_batch();
+            wb.set_max_pending_txns(2);
+            let mut res = Ok(());
+            for i in 0..20_000 {
+                res = wb.set(key(i), val(i));
+                if res.is_err() {
+                    break;
+                }
+            }
+            let res = res.and_then(|()| wb.flush());
+            if let Err(e) = res {
+                assert!(matches!(e.root(), Error::BlockedWrites), "{e}");
+            }
+        });
+        assert_marks_settled(db);
+        db.update(|txn| txn.set("after", "drop")).unwrap();
+        db.view(|txn| txn.get(b"after").map(|_| ())).unwrap();
     });
 }

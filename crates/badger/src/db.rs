@@ -34,7 +34,7 @@ use crate::levels::{LevelInfo, LevelsController, TableInfo, base_table_options};
 use crate::manifest::ManifestFile;
 use crate::memtable::{MemTable, open_mem_tables};
 use crate::options::Options;
-use crate::oracle::Oracle;
+use crate::oracle::{CommitMark, Oracle};
 use crate::structs::Entry;
 use crate::table::{TableOptions, new_block_cache, new_index_cache};
 use crate::txn::Txn;
@@ -839,16 +839,15 @@ impl DbInner {
     /// Queues `entries` as one write request (Go's `sendToWriteCh`) and
     /// returns the channel that receives its result.
     pub(crate) fn send_to_write_ch(&self, entries: Vec<Entry>) -> Result<Receiver<Result<()>>> {
-        self.send_commit_to_write_ch(entries, 0)
+        self.send_commit_to_write_ch(entries, None)
     }
 
-    /// Like [`DbInner::send_to_write_ch`], for a transaction with commit
-    /// timestamp `commit_ts`: the writer marks it done after writing. If this
-    /// fails, the caller must mark it done.
+    /// Like [`DbInner::send_to_write_ch`], for a transaction whose commit
+    /// mark the writer drops after writing (or anything else on failure).
     pub(crate) fn send_commit_to_write_ch(
         &self,
         mut entries: Vec<Entry>,
-        commit_ts: u64,
+        commit_mark: Option<CommitMark>,
     ) -> Result<Receiver<Result<()>>> {
         if self.block_writes.load(Ordering::SeqCst) {
             return Err(Error::BlockedWrites);
@@ -876,7 +875,7 @@ impl DbInner {
         tx.send(Request {
             entries,
             done: done_tx,
-            commit_ts,
+            commit_mark,
         })
         .map_err(|_| Error::BlockedWrites)?;
         Ok(done_rx)
@@ -907,7 +906,7 @@ impl DbInner {
                 .send(Request {
                     entries: Vec::new(),
                     done: done_tx,
-                    commit_ts: 0,
+                    commit_mark: None,
                 })
                 .is_ok()
             {

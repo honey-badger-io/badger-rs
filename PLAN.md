@@ -341,16 +341,20 @@ iterator prefetch, Stream, StreamWriter, backup/load, Subscribe, key rotation.
 
 Deviations and findings so far:
 - `Txn::start_commit` returns a `PendingCommit` (wait for the result with
-  `wait`) instead of Go's `CommitWith` callback. The writer thread marks the
-  commit done after writing it, so a commit is visible to new transactions
+  `wait`) instead of Go's `CommitWith` callback. The write request owns a
+  `CommitMark` guard that marks the commit timestamp done when dropped: the
+  writer drops it after writing, so a commit is visible to new transactions
   whether or not anyone waits (a new non-managed transaction waits for every
-  earlier commit, as in Go).
+  earlier commit, as in Go). Any other fate of the request (failed send,
+  writer panic) drops it too, so reads never wait forever.
 - `WriteBatch` methods take `&mut self` (no internal mutex); `flush`
   consumes the batch and dropping it cancels, so Go's
   `ErrCommitAfterFinish` cannot happen. In-flight commits are bounded by
   waiting on the oldest `PendingCommit` instead of a `y.Throttle`.
 - As in Go, after a commit error the batch keeps buffering writes, but
-  nothing more is committed and `flush` returns the error.
+  nothing more is committed and `flush` returns the error. Unlike Go, not
+  even one more transaction is committed once an error is seen, and `flush`
+  waits for commits in flight even when its own commit fails.
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).
