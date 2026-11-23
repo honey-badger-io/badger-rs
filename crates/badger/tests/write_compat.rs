@@ -487,3 +487,41 @@ fn stream_copy_go_can_read() {
     .write(&out.join(format!("{name}.json")))
     .unwrap();
 }
+
+/// Phase 7: data keys rotated on every table, then the master key rotated
+/// by Rust; Go opens the DB with the new master key.
+#[test]
+fn rotated_keys_go_can_read() {
+    let (_tmp, out) = out_dir();
+    let name = "rust-rotated";
+    let dir = out.join(name);
+    let _ = fs::remove_dir_all(&dir);
+    let mut o = base();
+    o.encryption_key = (100..132).collect();
+    o.value_threshold = 128;
+    o.mem_table_size = 64 << 10;
+    let opt = options(&dir, &o).with_encryption_key_rotation_duration(std::time::Duration::ZERO);
+    let db = DB::open(opt).unwrap();
+    let mut model = Model::new();
+    write_vlog(&db, &mut model);
+    db.close().unwrap();
+
+    let new_key: Vec<u8> = (200..216).collect();
+    badger::key_registry::rotate_master_key(&dir, &o.encryption_key, &new_key).unwrap();
+    o.encryption_key = new_key;
+    let db = DB::open(options(&dir, &o).with_read_only(true)).unwrap();
+    assert_eq!(latest(&db), model);
+    let entries = dump(&db);
+    let max_version = db.max_version();
+    db.close().unwrap();
+    DbExpected {
+        format_version: 1,
+        name: name.into(),
+        options: o,
+        crash_snapshot: false,
+        max_version,
+        entries,
+    }
+    .write(&out.join(format!("{name}.json")))
+    .unwrap();
+}

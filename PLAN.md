@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: everything but encryption key rotation done.
+**Status:** Phase 7 done (2026-11-23). Next: Phase 8.
 
 ## Decisions
 
@@ -334,22 +334,22 @@ Deviations and findings:
 - `flatten`, `drop_all`, `drop_prefix`, banned namespaces.
 - **Done when:** a long randomized workload test (model = `BTreeMap`) passes with compaction and GC active; Go reads the result.
 
-### Phase 7: remaining features
-Progress: `WriteBatch` (`src/batch.rs`, Go's `batch_test.go` and the
-write batch tests of `managed_db_test.go` ported); merge operator
-(`src/merge.rs`, `merge_test.go` ported); iterator value prefetching (the
-remaining iterator tests of `iterator_test.go`, `db_test.go` and
-`txn_test.go` ported, in `src/db/iterator_tests.rs`); Stream
-(`src/stream.rs`, `stream_test.go` ported, the manual big-stream tests at a
-smaller size); StreamWriter (`src/stream_writer.rs`,
-`stream_writer_test.go` ported; `tests/write_compat.rs` copies a DB with
-Stream → StreamWriter and Go verifies the copy); backup/load
-(`src/backup.rs`, `backup_test.go` ported; `tests/backup_compat.rs` loads
-Go's backups of fixture DBs, committed in `compat/fixtures/backup`, and Go
-loads Rust's in `make compat`); Subscribe (`src/publisher.rs`,
-`publisher_test.go` ported). Next: encryption key rotation.
+### Phase 7: remaining features (done)
+Result: `crates/badger/src/{batch,merge,stream,stream_writer,backup,publisher}.rs`,
+iterator prefetching in `iterator.rs`, and `key_registry::rotate_master_key`.
+Ported: `batch_test.go`, the write batch tests of `managed_db_test.go`,
+`merge_test.go`, the remaining iterator tests (`iterator_test.go`,
+`db_test.go`, `txn_test.go`; in `src/db/iterator_tests.rs`),
+`stream_test.go` (the manual big-stream tests at a smaller size),
+`stream_writer_test.go`, `backup_test.go`, `publisher_test.go` and
+`badger/cmd/rotate_test.go` (`tests/key_rotation.rs`). Compatibility:
+`tests/backup_compat.rs` loads Go's backups of fixture DBs (committed in
+`compat/fixtures/backup`, written by `go-fixtures gen`) and Go loads
+Rust's (`go-fixtures verify-backup`); `tests/write_compat.rs` adds a DB
+copied with Stream → StreamWriter and one whose data keys rotated per table
+and whose master key Rust rotated, both verified by Go (`make compat`, CI).
 
-Deviations and findings so far:
+Deviations and findings:
 - `Txn::start_commit` returns a `PendingCommit` (wait for the result with
   `wait`) instead of Go's `CommitWith` callback. The write request owns a
   `CommitMark` guard that marks the commit timestamp done when dropped: the
@@ -406,6 +406,10 @@ Deviations and findings so far:
   Go's, so a stalled subscriber eventually blocks writes, as in Go. Like
   Go, `meta` carries the user meta, deletes arrive with empty values, and
   an empty prefix also matches the `!badger!txn` markers.
+- Master key rotation is a library function, `rotate_master_key(dir, old,
+  new)` (Go has it only in the `rotate` command; the CLI comes in Phase 8).
+  It takes the directory lock, so it fails on an open DB (Go does not
+  check). Data keys rotate by age as in Go (Phase 3).
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).

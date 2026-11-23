@@ -4,7 +4,7 @@ A learning port of [Badger](https://github.com/dgraph-io/badger) v4.9.6 to Rust.
 It aims to stay on-disk compatible with Go Badger: each implementation can open
 databases written by the other.
 
-See [PLAN.md](PLAN.md) for the roadmap. Current status: **Phase 6 (compaction and value log GC) done**: Rust reads every Go fixture DB, Go reads DBs written by Rust, including after a long randomized workload with compaction and GC running. Next is Phase 7 (iterator prefetch, `WriteBatch`, streams, backups, subscriptions).
+See [PLAN.md](PLAN.md) for the roadmap. Current status: **Phase 7 (remaining features) done**: write batches, the merge operator, iterator prefetching, streams and the stream writer, backups that load across Go and Rust in both directions, subscriptions and encryption key rotation. Next is Phase 8 (CLI and hardening).
 
 ## Layout
 
