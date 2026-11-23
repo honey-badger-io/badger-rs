@@ -49,6 +49,7 @@ pub mod options;
 mod oracle;
 pub mod pb;
 pub mod skl;
+pub mod stream;
 pub mod structs;
 pub mod table;
 pub mod trie;
@@ -64,6 +65,7 @@ pub use iterator::{Item, Iterator, IteratorOptions};
 pub use levels::{LevelInfo, TableInfo};
 pub use merge::MergeOperator;
 pub use options::Options;
+pub use stream::Stream;
 pub use structs::Entry;
 pub use txn::{PendingCommit, Txn};
 

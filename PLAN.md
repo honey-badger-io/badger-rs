@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator and iterator prefetch done.
+**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator, iterator prefetch and Stream done.
 
 ## Decisions
 
@@ -339,8 +339,9 @@ Progress: `WriteBatch` (`src/batch.rs`, Go's `batch_test.go` and the
 write batch tests of `managed_db_test.go` ported); merge operator
 (`src/merge.rs`, `merge_test.go` ported); iterator value prefetching (the
 remaining iterator tests of `iterator_test.go`, `db_test.go` and
-`txn_test.go` ported, in `src/db/iterator_tests.rs`). Next: Stream,
-StreamWriter, backup/load, Subscribe, key rotation.
+`txn_test.go` ported, in `src/db/iterator_tests.rs`); Stream
+(`src/stream.rs`, `stream_test.go` ported, the manual big-stream tests at a
+smaller size). Next: StreamWriter, backup/load, Subscribe, key rotation.
 
 Deviations and findings so far:
 - `Txn::start_commit` returns a `PendingCommit` (wait for the result with
@@ -370,6 +371,14 @@ Deviations and findings so far:
   is silent; `Item::value` reads again and returns the error (Go logs it
   and returns an empty value). Without `prefetch_values` the buffer holds
   one item and values are read on demand.
+- `Stream::orchestrate(send)`: `send` gets a `pb::KvList` (not a
+  `z.Buffer`) on the calling thread. All producer threads share one
+  read-only transaction, so the stream is one snapshot (Go's goroutines
+  each take a read timestamp in non-managed mode). Range boundaries are
+  user keys, so each key is in exactly one range by plain comparison (Go
+  splits at internal keys). No context: an error from a producer or `send`
+  stops everything and the first cause is returned. Go's two key-to-list
+  callbacks are one that also gets the thread id.
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).
