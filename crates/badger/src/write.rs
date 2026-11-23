@@ -61,6 +61,11 @@ pub(crate) fn write_loop(db: &DbInner, rx: Receiver<Request>) {
 /// `writeRequests`).
 fn write_requests(db: &DbInner, reqs: &mut [Request]) -> Result<()> {
     let res = write_requests_inner(db, reqs);
+    if res.is_ok() {
+        // Before the committers hear back, as in Go.
+        db.publisher
+            .send_updates(reqs.iter().flat_map(|r| r.entries.iter()));
+    }
     let shared = res.as_ref().err().map(|e| Arc::new(clone_err(e)));
     for r in reqs.iter_mut() {
         let out = match &shared {

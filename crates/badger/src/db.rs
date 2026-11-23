@@ -15,7 +15,6 @@
 //!   waits for the flush queue to empty.
 //! - `drop_all` does not restart table ids at 1, so a table still open in a
 //!   reader can never share a file name with a new one.
-//! - No subscriptions yet (Phase 7).
 
 use std::collections::HashSet;
 use std::fs;
@@ -35,6 +34,7 @@ use crate::manifest::ManifestFile;
 use crate::memtable::{MemTable, open_mem_tables};
 use crate::options::Options;
 use crate::oracle::{CommitMark, Oracle};
+use crate::publisher::{self, Publisher};
 use crate::structs::Entry;
 use crate::table::{TableOptions, new_block_cache, new_index_cache};
 use crate::txn::Txn;
@@ -55,6 +55,7 @@ pub struct DB {
     pub(crate) inner: Arc<DbInner>,
     writer: Option<JoinHandle<()>>,
     flusher: Option<JoinHandle<()>>,
+    publisher: Option<JoinHandle<()>>,
     /// `None` while stopped (and always in read-only mode).
     compactors: Mutex<Option<Compactors>>,
 }
@@ -92,6 +93,8 @@ pub(crate) struct DbInner {
     /// Queue to the flush thread.
     pub flush_tx: Sender<FlushMsg>,
     pub block_writes: AtomicBool,
+    /// Delivers writes to subscribers.
+    pub publisher: Publisher,
     /// Set while a drop runs: flushes to L0 do not wait for compaction.
     l0_stall_disabled: AtomicBool,
     banned_namespaces: RwLock<HashSet<u64>>,
@@ -166,6 +169,7 @@ impl DB {
 
         let (write_tx, write_rx) = crossbeam_channel::bounded(WRITE_CH_CAPACITY);
         let (flush_tx, flush_rx) = crossbeam_channel::bounded(opt.num_memtables.max(1));
+        let (publisher, publish_rx) = Publisher::new();
         let imm_to_flush = if opt.read_only {
             Vec::new()
         } else {
@@ -183,6 +187,7 @@ impl DB {
             write_tx: RwLock::new((!opt.read_only).then_some(write_tx)),
             flush_tx,
             block_writes: AtomicBool::new(opt.read_only),
+            publisher,
             l0_stall_disabled: AtomicBool::new(false),
             banned_namespaces: RwLock::new(HashSet::new()),
             closed: AtomicBool::new(false),
@@ -194,8 +199,15 @@ impl DB {
             inner,
             writer: None,
             flusher: None,
+            publisher: None,
             compactors: Mutex::new(None),
         };
+        let registry = Arc::clone(&db.inner.publisher.registry);
+        db.publisher = Some(
+            std::thread::Builder::new()
+                .name("badger-publish".into())
+                .spawn(move || publisher::publish_loop(&registry, publish_rx))?,
+        );
         if !db.inner.opt.read_only {
             db.start_threads(write_rx, flush_rx)?;
             db.start_compactions()?;
@@ -702,6 +714,10 @@ impl DB {
         // A flush stalled on L0 gives up waiting now.
         inner.lc.signal_l0_drained();
         if inner.opt.read_only {
+            inner.publisher.close();
+            if let Some(t) = self.publisher.take() {
+                let _ = t.join();
+            }
             return Ok(());
         }
 
@@ -709,6 +725,11 @@ impl DB {
         // disconnects the channel after the queued requests.
         drop(inner.write_tx.write().unwrap().take());
         if let Some(t) = self.writer.take() {
+            let _ = t.join();
+        }
+        // No more writes to publish: end the subscriptions.
+        inner.publisher.close();
+        if let Some(t) = self.publisher.take() {
             let _ = t.join();
         }
 

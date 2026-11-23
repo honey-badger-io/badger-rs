@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator, iterator prefetch, Stream, StreamWriter and backup/load done.
+**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: everything but encryption key rotation done.
 
 ## Decisions
 
@@ -346,7 +346,8 @@ smaller size); StreamWriter (`src/stream_writer.rs`,
 Stream → StreamWriter and Go verifies the copy); backup/load
 (`src/backup.rs`, `backup_test.go` ported; `tests/backup_compat.rs` loads
 Go's backups of fixture DBs, committed in `compat/fixtures/backup`, and Go
-loads Rust's in `make compat`). Next: Subscribe, key rotation.
+loads Rust's in `make compat`); Subscribe (`src/publisher.rs`,
+`publisher_test.go` ported). Next: encryption key rotation.
 
 Deviations and findings so far:
 - `Txn::start_commit` returns a `PendingCommit` (wait for the result with
@@ -397,6 +398,14 @@ Deviations and findings so far:
   waiting on the oldest (Go: `y.Throttle`), and advances the oracle once
   at the end. A backup cut short is an error (`InvalidDump` for a partial
   length prefix).
+- `DB::subscribe(&matches)` returns a `Subscription` (`recv`,
+  `recv_timeout`; dropping it unsubscribes) instead of running a callback
+  until a context ends. It does not borrow the DB and ends (`None`) when
+  the DB closes. The writer thread matches keys (only with subscribers)
+  and queues only matching KVs to the publisher thread; queue sizes are
+  Go's, so a stalled subscriber eventually blocks writes, as in Go. Like
+  Go, `meta` carries the user meta, deletes arrive with empty values, and
+  an empty prefix also matches the `!badger!txn` markers.
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).
