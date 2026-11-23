@@ -31,6 +31,10 @@ use crate::util::value::ValueStruct;
 pub(crate) struct Request {
     pub entries: Vec<Entry>,
     pub done: Sender<Result<()>>,
+    /// The transaction's commit timestamp (0 if none). The writer marks it
+    /// done once the entries are written, so a committer does not need to
+    /// wait for the write to make it visible (Go's commit callback does this).
+    pub commit_ts: u64,
 }
 
 /// A memtable to flush, or `None` to stop the flush thread.
@@ -62,6 +66,11 @@ fn write_requests(db: &DbInner, reqs: &mut [Request]) -> Result<()> {
             None => Ok(()),
             Some(e) => Err(Error::Shared(Arc::clone(e))),
         };
+        // Visible to new reads before the committer hears back, as in Go
+        // (`doneCommit` runs before the callback).
+        if r.commit_ts != 0 {
+            db.orc.done_commit(r.commit_ts);
+        }
         // The committer may have given up waiting; that is fine.
         let _ = r.done.send(out);
     }

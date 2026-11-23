@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Next: Phase 7.
+**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch` done.
 
 ## Decisions
 
@@ -335,6 +335,23 @@ Deviations and findings:
 - **Done when:** a long randomized workload test (model = `BTreeMap`) passes with compaction and GC active; Go reads the result.
 
 ### Phase 7: remaining features
+Progress: `WriteBatch` (`src/batch.rs`, Go's `batch_test.go` and the
+write batch tests of `managed_db_test.go` ported). Next: merge operator,
+iterator prefetch, Stream, StreamWriter, backup/load, Subscribe, key rotation.
+
+Deviations and findings so far:
+- `Txn::start_commit` returns a `PendingCommit` (wait for the result with
+  `wait`) instead of Go's `CommitWith` callback. The writer thread marks the
+  commit done after writing it, so a commit is visible to new transactions
+  whether or not anyone waits (a new non-managed transaction waits for every
+  earlier commit, as in Go).
+- `WriteBatch` methods take `&mut self` (no internal mutex); `flush`
+  consumes the batch and dropping it cancels, so Go's
+  `ErrCommitAfterFinish` cannot happen. In-flight commits are bounded by
+  waiting on the oldest `PendingCommit` instead of a `y.Throttle`.
+- As in Go, after a commit error the batch keeps buffering writes, but
+  nothing more is committed and `flush` returns the error.
+
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).
 - Stream framework (`stream.go`), `StreamWriter` (`stream_writer.go`).

@@ -52,7 +52,7 @@ pub(crate) const WRITE_CH_CAPACITY: usize = 1000;
 /// An open database. Share it between threads by reference (`&DB` is
 /// `Send`), or put it in an `Arc`.
 pub struct DB {
-    inner: Arc<DbInner>,
+    pub(crate) inner: Arc<DbInner>,
     writer: Option<JoinHandle<()>>,
     flusher: Option<JoinHandle<()>>,
     /// `None` while stopped (and always in read-only mode).
@@ -838,7 +838,18 @@ impl DbInner {
 
     /// Queues `entries` as one write request (Go's `sendToWriteCh`) and
     /// returns the channel that receives its result.
-    pub(crate) fn send_to_write_ch(&self, mut entries: Vec<Entry>) -> Result<Receiver<Result<()>>> {
+    pub(crate) fn send_to_write_ch(&self, entries: Vec<Entry>) -> Result<Receiver<Result<()>>> {
+        self.send_commit_to_write_ch(entries, 0)
+    }
+
+    /// Like [`DbInner::send_to_write_ch`], for a transaction with commit
+    /// timestamp `commit_ts`: the writer marks it done after writing. If this
+    /// fails, the caller must mark it done.
+    pub(crate) fn send_commit_to_write_ch(
+        &self,
+        mut entries: Vec<Entry>,
+        commit_ts: u64,
+    ) -> Result<Receiver<Result<()>>> {
         if self.block_writes.load(Ordering::SeqCst) {
             return Err(Error::BlockedWrites);
         }
@@ -865,6 +876,7 @@ impl DbInner {
         tx.send(Request {
             entries,
             done: done_tx,
+            commit_ts,
         })
         .map_err(|_| Error::BlockedWrites)?;
         Ok(done_rx)
@@ -895,6 +907,7 @@ impl DbInner {
                 .send(Request {
                     entries: Vec::new(),
                     done: done_tx,
+                    commit_ts: 0,
                 })
                 .is_ok()
             {
