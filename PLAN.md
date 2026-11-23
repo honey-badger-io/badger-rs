@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator, iterator prefetch and Stream done.
+**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch`, merge operator, iterator prefetch, Stream and StreamWriter done.
 
 ## Decisions
 
@@ -341,7 +341,10 @@ write batch tests of `managed_db_test.go` ported); merge operator
 remaining iterator tests of `iterator_test.go`, `db_test.go` and
 `txn_test.go` ported, in `src/db/iterator_tests.rs`); Stream
 (`src/stream.rs`, `stream_test.go` ported, the manual big-stream tests at a
-smaller size). Next: StreamWriter, backup/load, Subscribe, key rotation.
+smaller size); StreamWriter (`src/stream_writer.rs`,
+`stream_writer_test.go` ported; `tests/write_compat.rs` copies a DB with
+Stream → StreamWriter and Go verifies the copy). Next: backup/load,
+Subscribe, key rotation.
 
 Deviations and findings so far:
 - `Txn::start_commit` returns a `PendingCommit` (wait for the result with
@@ -379,6 +382,15 @@ Deviations and findings so far:
   splits at internal keys). No context: an error from a producer or `send`
   stops everything and the first cause is returned. Go's two key-to-list
   callbacks are one that also gets the thread id.
+- `StreamWriter::write` takes a `pb::KvList`. The streams of one `write`
+  are built on scoped threads; each writes its full tables synchronously
+  (Go: a goroutine per stream and per table). A write to a closed stream
+  or keys out of order are errors (Go panics). `flush` consumes the
+  writer, dropping it is `Cancel`; the pause on writes and compactions is
+  a guard held from `prepare` on. A non-managed flush advances the oracle
+  in place (only ever forward) instead of replacing it.
+  `prepare_incremental` on a DB with only L0 data flattens it and writes
+  above the level the data landed on (Go assumes the last level).
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).

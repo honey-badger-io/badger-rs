@@ -425,3 +425,65 @@ fn managed_db_go_can_read() {
     .write(&out.join(format!("{name}.json")))
     .unwrap();
 }
+
+/// Phase 7: a DB copied with Stream → StreamWriter, which builds the
+/// tables directly (bottom level, value log for big values).
+#[test]
+fn stream_copy_go_can_read() {
+    let (_tmp, out) = out_dir();
+    let name = "rust-stream-copy";
+    let mut o = base();
+    o.value_threshold = 128;
+    o.num_versions_to_keep = 1000;
+
+    // The source: versions, deletes, expiries, value log values.
+    let src_dir = tempfile::tempdir().unwrap();
+    let src = DB::open(options(src_dir.path(), &o)).unwrap();
+    let mut model = Model::new();
+    write_versions(&src, &mut model);
+    write_vlog(&src, &mut model);
+
+    let dir = out.join(name);
+    let _ = fs::remove_dir_all(&dir);
+    let opt = options(&dir, &o);
+    let dst = DB::open(opt.clone()).unwrap();
+    let mut sw = dst.new_stream_writer();
+    sw.prepare().unwrap();
+    let mut stream = src.new_stream();
+    stream.send_done_markers(true);
+    stream.orchestrate(|list| sw.write(&list)).unwrap();
+    drop(stream);
+    sw.flush().unwrap();
+    assert_eq!(latest(&dst), model, "copy right after the stream write");
+    // New commits get timestamps above every copied version.
+    assert!(dst.max_version() >= src.max_version());
+    src.close().unwrap();
+    dst.close().unwrap();
+
+    let names: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.iter().any(|n| n.ends_with(".vlog")), "{names:?}");
+    let db = DB::open(opt.with_read_only(true)).unwrap();
+    assert_eq!(latest(&db), model, "copy after reopening");
+    // All tables sit on the last level.
+    assert!(
+        db.tables().iter().all(|t| t.level == 6),
+        "{:?}",
+        db.tables()
+    );
+    let entries = dump(&db);
+    let max_version = db.max_version();
+    db.close().unwrap();
+    DbExpected {
+        format_version: 1,
+        name: name.into(),
+        options: o,
+        crash_snapshot: false,
+        max_version,
+        entries,
+    }
+    .write(&out.join(format!("{name}.json")))
+    .unwrap();
+}

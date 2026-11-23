@@ -50,6 +50,7 @@ mod oracle;
 pub mod pb;
 pub mod skl;
 pub mod stream;
+pub mod stream_writer;
 pub mod structs;
 pub mod table;
 pub mod trie;
@@ -66,6 +67,7 @@ pub use levels::{LevelInfo, TableInfo};
 pub use merge::MergeOperator;
 pub use options::Options;
 pub use stream::Stream;
+pub use stream_writer::StreamWriter;
 pub use structs::Entry;
 pub use txn::{PendingCommit, Txn};
 

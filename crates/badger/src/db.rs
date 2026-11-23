@@ -237,7 +237,7 @@ impl DB {
     }
 
     /// Starts the compactor threads (Go's `startCompactions`).
-    fn start_compactions(&self) -> Result<()> {
+    pub(crate) fn start_compactions(&self) -> Result<()> {
         let mut slot = self.compactors.lock().unwrap();
         if slot.is_some() || self.inner.opt.read_only {
             return Ok(());
@@ -259,7 +259,7 @@ impl DB {
 
     /// Stops the compactor threads, waiting for running compactions (Go's
     /// `stopCompactions`).
-    fn stop_compactions(&self) {
+    pub(crate) fn stop_compactions(&self) {
         let Some(c) = self.compactors.lock().unwrap().take() else {
             return;
         };
@@ -457,7 +457,7 @@ impl DB {
         res.and(started)
     }
 
-    fn flatten_inner(&self, workers: usize) -> Result<()> {
+    pub(crate) fn flatten_inner(&self, workers: usize) -> Result<()> {
         let db = &*self.inner;
         let compact_away = |cp: CompactionPriority| -> Result<()> {
             log::info!("Attempting to compact with {cp:?}");
@@ -517,7 +517,7 @@ impl DB {
 
     /// Stops writes until the returned guard is dropped: queued writes are
     /// applied and every full memtable is flushed (Go's `prepareToDrop`).
-    fn prepare_to_drop(&self) -> Result<DropGuard<'_>> {
+    pub(crate) fn prepare_to_drop(&self) -> Result<DropGuard<'_>> {
         assert!(
             !self.inner.opt.read_only,
             "Attempting to drop data in read-only mode."
@@ -548,7 +548,7 @@ impl DB {
         res.and(started)
     }
 
-    fn drop_all_inner(&self) -> Result<()> {
+    pub(crate) fn drop_all_inner(&self) -> Result<()> {
         let db = &*self.inner;
         let mut mem = db.mem.lock().unwrap();
         if let Some(mt) = mem.mt.take() {
@@ -934,7 +934,7 @@ fn fill_tables_error() -> Error {
 }
 
 /// Undoes `prepare_to_drop` when dropped: writes resume.
-struct DropGuard<'a> {
+pub(crate) struct DropGuard<'a> {
     db: &'a DbInner,
 }
 

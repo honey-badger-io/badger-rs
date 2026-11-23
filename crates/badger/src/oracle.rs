@@ -189,6 +189,18 @@ impl Oracle {
         self.read_mark.done(read_ts);
     }
 
+    /// After a stream writer wrote versions up to `max_version` directly
+    /// into the tables: later commits get bigger timestamps and new reads
+    /// see them (Go replaces the oracle). Writes must be blocked.
+    pub fn advance_to(&self, max_version: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.next_txn_ts <= max_version {
+            state.next_txn_ts = max_version + 1;
+            // No commit is pending, so nothing below can hold the mark back.
+            self.txn_mark.done(max_version);
+        }
+    }
+
     /// A guard that marks commit `ts` done when dropped (`None` in managed
     /// mode, which has no commit marks).
     pub fn commit_mark(&self, ts: u64) -> Option<CommitMark> {
