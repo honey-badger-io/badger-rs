@@ -22,6 +22,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use crate::db::{DbInner, WRITE_CH_CAPACITY};
 use crate::error::{Error, Result, ResultExt};
 use crate::memtable::MemTable;
+use crate::oracle::CommitMark;
 use crate::structs::{BIT_VALUE_POINTER, Entry, ValuePointer};
 use crate::table::{Table, TableBuilder, new_filename};
 use crate::util::KvIterator;
@@ -31,6 +32,10 @@ use crate::util::value::ValueStruct;
 pub(crate) struct Request {
     pub entries: Vec<Entry>,
     pub done: Sender<Result<()>>,
+    /// The transaction's commit mark, if any. The writer drops it once the
+    /// entries are written, so a committer does not need to wait for the
+    /// write to make it visible (Go's commit callback does this).
+    pub commit_mark: Option<CommitMark>,
 }
 
 /// A memtable to flush, or `None` to stop the flush thread.
@@ -56,12 +61,20 @@ pub(crate) fn write_loop(db: &DbInner, rx: Receiver<Request>) {
 /// `writeRequests`).
 fn write_requests(db: &DbInner, reqs: &mut [Request]) -> Result<()> {
     let res = write_requests_inner(db, reqs);
+    if res.is_ok() {
+        // Before the committers hear back, as in Go.
+        db.publisher
+            .send_updates(reqs.iter().flat_map(|r| r.entries.iter()));
+    }
     let shared = res.as_ref().err().map(|e| Arc::new(clone_err(e)));
-    for r in reqs.iter() {
+    for r in reqs.iter_mut() {
         let out = match &shared {
             None => Ok(()),
             Some(e) => Err(Error::Shared(Arc::clone(e))),
         };
+        // Visible to new reads before the committer hears back, as in Go
+        // (`doneCommit` runs before the callback).
+        drop(r.commit_mark.take());
         // The committer may have given up waiting; that is fine.
         let _ = r.done.send(out);
     }

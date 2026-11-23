@@ -14,7 +14,7 @@
 //!   remembered until no running read can predate them.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::util::WaterMark;
 
@@ -26,7 +26,7 @@ pub(crate) struct Oracle {
     /// writes reach the write channel in commit timestamp order.
     pub write_ch_lock: Mutex<()>,
     pub read_mark: WaterMark,
-    pub txn_mark: WaterMark,
+    pub txn_mark: Arc<WaterMark>,
 }
 
 #[derive(Default)]
@@ -71,7 +71,7 @@ impl Oracle {
             }),
             write_ch_lock: Mutex::new(()),
             read_mark: WaterMark::new("badger.PendingReads"),
-            txn_mark: WaterMark::new("badger.TxnTimestamp"),
+            txn_mark: Arc::new(WaterMark::new("badger.TxnTimestamp")),
         };
         orc.txn_mark.done(max_version);
         orc.read_mark.done(max_version);
@@ -189,11 +189,51 @@ impl Oracle {
         self.read_mark.done(read_ts);
     }
 
-    /// Marks commit `ts` as applied, making it visible to new reads.
+    /// After a stream writer wrote versions up to `max_version` directly
+    /// into the tables: later commits get bigger timestamps and new reads
+    /// see them (Go replaces the oracle). Writes must be blocked.
+    pub fn advance_to(&self, max_version: u64) {
+        let mut state = self.state.lock().unwrap();
+        if state.next_txn_ts <= max_version {
+            state.next_txn_ts = max_version + 1;
+            // No commit is pending, so nothing below can hold the mark back.
+            self.txn_mark.done(max_version);
+        }
+    }
+
+    /// A guard that marks commit `ts` done when dropped (`None` in managed
+    /// mode, which has no commit marks).
+    pub fn commit_mark(&self, ts: u64) -> Option<CommitMark> {
+        (!self.is_managed).then(|| CommitMark {
+            mark: Arc::clone(&self.txn_mark),
+            ts,
+        })
+    }
+
+    /// Marks commit `ts` as applied, making it visible to new reads (the
+    /// write path uses [`CommitMark`]).
+    #[cfg(test)]
     pub fn done_commit(&self, ts: u64) {
         if !self.is_managed {
             self.txn_mark.done(ts);
         }
+    }
+}
+
+/// Marks a commit timestamp done when dropped, making the commit visible to
+/// new reads. Owned by the write request, so the timestamp is marked done
+/// exactly once whatever happens to the request: the writer drops it after
+/// writing the entries; a request that fails to send, or is dropped
+/// unprocessed (writer thread panic), drops it too, so later reads never
+/// wait forever.
+pub(crate) struct CommitMark {
+    mark: Arc<WaterMark>,
+    ts: u64,
+}
+
+impl Drop for CommitMark {
+    fn drop(&mut self) {
+        self.mark.done(self.ts);
     }
 }
 
@@ -219,6 +259,27 @@ mod tests {
             orc.done_read(ts);
             assert_eq!(orc.read_mark.done_until(), max);
         }
+    }
+
+    #[test]
+    fn commit_mark_is_done_on_drop() {
+        let orc = Oracle::new(false, true, 0);
+        let none = HashSet::new();
+        let req = CommitRequest {
+            read_ts: 0,
+            read_mark_ts: 0,
+            reads: &[],
+            conflict_keys: &none,
+            managed_commit_ts: 0,
+        };
+        let mut done_read = true;
+        let ts = orc.new_commit_ts(&req, &mut done_read).unwrap();
+        let mark = orc.commit_mark(ts).unwrap();
+        assert_eq!(orc.txn_mark.done_until(), ts - 1);
+        // Dropped unprocessed (as when the writer thread dies): still done.
+        drop(mark);
+        assert_eq!(orc.txn_mark.done_until(), ts);
+        assert!(Oracle::new(true, true, 0).commit_mark(1).is_none());
     }
 
     #[test]

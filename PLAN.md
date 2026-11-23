@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Next: Phase 7.
+**Status:** Phase 7 done (2026-11-23). Next: Phase 8.
 
 ## Decisions
 
@@ -334,7 +334,83 @@ Deviations and findings:
 - `flatten`, `drop_all`, `drop_prefix`, banned namespaces.
 - **Done when:** a long randomized workload test (model = `BTreeMap`) passes with compaction and GC active; Go reads the result.
 
-### Phase 7: remaining features
+### Phase 7: remaining features (done)
+Result: `crates/badger/src/{batch,merge,stream,stream_writer,backup,publisher}.rs`,
+iterator prefetching in `iterator.rs`, and `key_registry::rotate_master_key`.
+Ported: `batch_test.go`, the write batch tests of `managed_db_test.go`,
+`merge_test.go`, the remaining iterator tests (`iterator_test.go`,
+`db_test.go`, `txn_test.go`; in `src/db/iterator_tests.rs`),
+`stream_test.go` (the manual big-stream tests at a smaller size),
+`stream_writer_test.go`, `backup_test.go`, `publisher_test.go` and
+`badger/cmd/rotate_test.go` (`tests/key_rotation.rs`). Compatibility:
+`tests/backup_compat.rs` loads Go's backups of fixture DBs (committed in
+`compat/fixtures/backup`, written by `go-fixtures gen`) and Go loads
+Rust's (`go-fixtures verify-backup`); `tests/write_compat.rs` adds a DB
+copied with Stream → StreamWriter and one whose data keys rotated per table
+and whose master key Rust rotated, both verified by Go (`make compat`, CI).
+
+Deviations and findings:
+- `Txn::start_commit` returns a `PendingCommit` (wait for the result with
+  `wait`) instead of Go's `CommitWith` callback. The write request owns a
+  `CommitMark` guard that marks the commit timestamp done when dropped: the
+  writer drops it after writing, so a commit is visible to new transactions
+  whether or not anyone waits (a new non-managed transaction waits for every
+  earlier commit, as in Go). Any other fate of the request (failed send,
+  writer panic) drops it too, so reads never wait forever.
+- `WriteBatch` methods take `&mut self` (no internal mutex); `flush`
+  consumes the batch and dropping it cancels, so Go's
+  `ErrCommitAfterFinish` cannot happen. In-flight commits are bounded by
+  waiting on the oldest `PendingCommit` instead of a `y.Throttle`.
+- As in Go, after a commit error the batch keeps buffering writes, but
+  nothing more is committed and `flush` returns the error. Unlike Go, not
+  even one more transaction is committed once an error is seen, and `flush`
+  waits for commits in flight even when its own commit fails.
+- `MergeOperator` borrows the DB; dropping it (or `stop`) stops its thread
+  after a last merge. The merged value is written synchronously, so it is
+  in the DB once `stop` returns (Go's `batchSetAsync` does not wait).
+  `get_merge_operator` panics on a managed DB (Go's goroutine panics on its
+  first merge instead).
+- Prefetching reads ahead in batches: the iterator keeps up to
+  `prefetch_size` items buffered and, when half are used, refills and
+  copies the new items' value log values, on up to 8 scoped threads for
+  batches of 16+ reads (Go starts a goroutine per item). A failed prefetch
+  is silent; `Item::value` reads again and returns the error (Go logs it
+  and returns an empty value). Without `prefetch_values` the buffer holds
+  one item and values are read on demand.
+- `Stream::orchestrate(send)`: `send` gets a `pb::KvList` (not a
+  `z.Buffer`) on the calling thread. All producer threads share one
+  read-only transaction, so the stream is one snapshot (Go's goroutines
+  each take a read timestamp in non-managed mode). Range boundaries are
+  user keys, so each key is in exactly one range by plain comparison (Go
+  splits at internal keys). No context: an error from a producer or `send`
+  stops everything and the first cause is returned. Go's two key-to-list
+  callbacks are one that also gets the thread id.
+- `StreamWriter::write` takes a `pb::KvList`. The streams of one `write`
+  are built on scoped threads; each writes its full tables synchronously
+  (Go: a goroutine per stream and per table). A write to a closed stream
+  or keys out of order are errors (Go panics). `flush` consumes the
+  writer, dropping it is `Cancel`; the pause on writes and compactions is
+  a guard held from `prepare` on. A non-managed flush advances the oracle
+  in place (only ever forward) instead of replacing it.
+  `prepare_incremental` on a DB with only L0 data flattens it and writes
+  above the level the data landed on (Go assumes the last level).
+- `DB::load` keeps at most `max_pending_writes` batches in flight by
+  waiting on the oldest (Go: `y.Throttle`), and advances the oracle once
+  at the end. A backup cut short is an error (`InvalidDump` for a partial
+  length prefix).
+- `DB::subscribe(&matches)` returns a `Subscription` (`recv`,
+  `recv_timeout`; dropping it unsubscribes) instead of running a callback
+  until a context ends. It does not borrow the DB and ends (`None`) when
+  the DB closes. The writer thread matches keys (only with subscribers)
+  and queues only matching KVs to the publisher thread; queue sizes are
+  Go's, so a stalled subscriber eventually blocks writes, as in Go. Like
+  Go, `meta` carries the user meta, deletes arrive with empty values, and
+  an empty prefix also matches the `!badger!txn` markers.
+- Master key rotation is a library function, `rotate_master_key(dir, old,
+  new)` (Go has it only in the `rotate` command; the CLI comes in Phase 8).
+  It takes the directory lock, so it fails on an open DB (Go does not
+  check). Data keys rotate by age as in Go (Phase 3).
+
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).
 - Stream framework (`stream.go`), `StreamWriter` (`stream_writer.go`).

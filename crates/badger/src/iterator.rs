@@ -9,11 +9,15 @@
 //! Differences from Go:
 //! - An update transaction's iterator sees its pending writes as they were
 //!   when the iterator was created.
-//! - No value prefetching yet (`prefetch_values` is ignored; values are read
-//!   on demand by [`Item::value`]). It comes with Phase 7.
+//! - Prefetching reads ahead in batches: when the buffer of upcoming items
+//!   runs low, it is refilled to `prefetch_size` and the new items' value
+//!   log values are copied, on scoped threads for bigger batches (Go starts
+//!   a goroutine per item). A failed prefetch is not reported; the value is
+//!   read again (and the error returned) by [`Item::value`].
 //! - `Close` is `Drop`, and the borrow checker replaces Go's "unclosed
 //!   iterator" panic in `Txn.Discard`.
 
+use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::db::DbInner;
@@ -57,6 +61,8 @@ pub struct Item<'a> {
     pub(crate) expires_at: u64,
     pub(crate) meta: u8,
     pub(crate) user_meta: u8,
+    /// The value, copied from the value log by prefetching.
+    pub(crate) val: Option<Vec<u8>>,
     pub(crate) db: &'a DbInner,
 }
 
@@ -81,6 +87,7 @@ impl<'a> Item<'a> {
             expires_at: vs.expires_at,
             meta: vs.meta,
             user_meta: vs.user_meta,
+            val: None,
             db,
         }
     }
@@ -98,6 +105,9 @@ impl<'a> Item<'a> {
     /// into a memory-mapped file and is only valid during the call; use
     /// [`Item::value_copy`] to keep it.
     pub fn value<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        if let Some(v) = &self.val {
+            return Ok(f(v));
+        }
         if self.meta & BIT_VALUE_POINTER == 0 {
             return Ok(f(&self.vptr));
         }
@@ -136,6 +146,19 @@ impl<'a> Item<'a> {
     /// Whether earlier versions of this key may be discarded.
     pub fn discard_earlier_versions(&self) -> bool {
         self.meta & BIT_DISCARD_EARLIER_VERSIONS != 0
+    }
+
+    /// Whether the value lives in the value log and was not prefetched yet.
+    fn needs_prefetch(&self) -> bool {
+        self.meta & BIT_VALUE_POINTER != 0 && self.val.is_none()
+    }
+
+    /// Copies the value from the value log (Go's `prefetchValue`). On error
+    /// the value stays unread; [`Item::value`] will try again.
+    fn prefetch_value(&mut self) {
+        if let Ok(v) = self.value(<[u8]>::to_vec) {
+            self.val = Some(v);
+        }
     }
 
     fn has_value(&self) -> bool {
@@ -177,9 +200,10 @@ impl<'a> Item<'a> {
 /// How to iterate (Go's `IteratorOptions`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IteratorOptions {
-    /// How many items to prefetch (ignored until prefetching is ported).
+    /// How many items to read ahead when prefetching values.
     pub prefetch_size: usize,
-    /// Whether to prefetch values (ignored until prefetching is ported).
+    /// Whether to read values ahead of use (recommended for long
+    /// iterations that read most values).
     pub prefetch_values: bool,
     /// Iterate from the biggest key down.
     pub reverse: bool,
@@ -284,7 +308,11 @@ pub struct Iterator<'t> {
     /// The prefix is a whole key (key iterators): match it exactly and use
     /// the bloom filters.
     prefix_is_key: bool,
-    item: Option<Item<'t>>,
+    /// The current item and the ones read ahead (Go's `item` and `data`).
+    data: VecDeque<Item<'t>>,
+    /// How many items to keep read ahead: `prefetch_size` when prefetching
+    /// values, else 1 (values are read lazily).
+    lookahead: usize,
     /// The previous key, to skip its older versions (forward only).
     last_key: Vec<u8>,
 }
@@ -311,13 +339,19 @@ impl<'t> Iterator<'t> {
         db.lc.append_iterators(&mut iters, &opt, prefix_is_key);
         // Value log GC keeps the files this iterator may read until it ends.
         db.vlog.incr_iterator_count();
+        let lookahead = if opt.prefetch_values {
+            opt.prefetch_size.max(1)
+        } else {
+            1
+        };
         Iterator {
             txn,
             iitr: MergeIterator::merge(iters, opt.reverse),
             read_ts: txn.read_ts(),
             opt,
             prefix_is_key,
-            item: None,
+            data: VecDeque::with_capacity(lookahead),
+            lookahead,
             last_key: Vec::new(),
         }
     }
@@ -327,14 +361,16 @@ impl<'t> Iterator<'t> {
     /// # Panics
     /// If the iterator is not [`valid`](Iterator::valid).
     pub fn item(&self) -> &Item<'t> {
-        let item = self.item.as_ref().expect("iterator is not valid");
+        let item = self.data.front().expect("iterator is not valid");
         self.txn.add_read_key(&item.key);
         item
     }
 
     /// Whether the iterator points at an item (within the prefix, if any).
     pub fn valid(&self) -> bool {
-        let Some(item) = &self.item else { return false };
+        let Some(item) = self.data.front() else {
+            return false;
+        };
         if self.prefix_is_key {
             item.key == self.opt.prefix
         } else {
@@ -344,22 +380,33 @@ impl<'t> Iterator<'t> {
 
     /// Whether the iterator is valid and the current key starts with `prefix`.
     pub fn valid_for_prefix(&self, prefix: &[u8]) -> bool {
-        self.valid() && self.item.as_ref().unwrap().key.starts_with(prefix)
+        self.valid() && self.data[0].key.starts_with(prefix)
     }
 
     /// Moves to the next item.
     pub fn next(&mut self) {
-        self.item = None;
-        self.advance();
+        self.data.pop_front();
+        // Refill in batches: once half the read-ahead is used up (always,
+        // without prefetching).
+        if self.data.len() <= self.lookahead / 2 {
+            self.fill();
+        }
     }
 
-    /// Parses entries until one becomes the current item, or the underlying
-    /// iterator ends (Go's `prefetch` / the loop in `Next`).
-    fn advance(&mut self) {
-        while self.iitr.as_ref().is_some_and(|i| i.valid()) && self.has_prefix() {
-            if self.parse_item() {
-                break;
-            }
+    /// Parses entries until `lookahead` items are buffered or the underlying
+    /// iterator ends, then prefetches the new items' values (Go's
+    /// `prefetch` and the loop in `Next`).
+    fn fill(&mut self) {
+        let before = self.data.len();
+        while self.data.len() < self.lookahead
+            && self.iitr.as_ref().is_some_and(|i| i.valid())
+            && self.has_prefix()
+        {
+            self.parse_item();
+        }
+        if self.opt.prefetch_values {
+            let new = &mut self.data.make_contiguous()[before..];
+            prefetch_values(new);
         }
     }
 
@@ -374,7 +421,7 @@ impl<'t> Iterator<'t> {
     }
 
     /// Looks at the current entry of the underlying iterator and advances it.
-    /// Returns true if an item was produced (Go's `parseItem`).
+    /// Returns true if an item was pushed to `data` (Go's `parseItem`).
     fn parse_item(&mut self) -> bool {
         let db = self.txn.db();
         let mi = self.iitr.as_mut().unwrap();
@@ -398,7 +445,8 @@ impl<'t> Iterator<'t> {
         }
 
         if self.opt.all_versions {
-            self.item = Some(Item::new(db, parse_key(key).to_vec(), version, mi.value()));
+            let item = Item::new(db, parse_key(key).to_vec(), version, mi.value());
+            self.data.push_back(item);
             mi.next();
             return true;
         }
@@ -425,12 +473,12 @@ impl<'t> Iterator<'t> {
             let item = Item::new(db, parse_key(key).to_vec(), parse_ts(key), vs);
             mi.next();
             if !self.opt.reverse || !mi.valid() {
-                self.item = Some(item);
+                self.data.push_back(item);
                 return true;
             }
             let next_ts = parse_ts(mi.key());
             if !(next_ts <= self.read_ts && parse_key(mi.key()) == item.key.as_slice()) {
-                self.item = Some(item);
+                self.data.push_back(item);
                 return true;
             }
         }
@@ -442,7 +490,7 @@ impl<'t> Iterator<'t> {
         if !key.is_empty() {
             self.txn.add_read_key(key);
         }
-        self.item = None;
+        self.data.clear();
         self.last_key.clear();
         let key = if key.is_empty() {
             self.opt.prefix.clone()
@@ -458,13 +506,47 @@ impl<'t> Iterator<'t> {
             let ts = if self.opt.reverse { 0 } else { self.read_ts };
             iitr.seek(&key_with_ts(&key, ts));
         }
-        self.advance();
+        self.fill();
     }
 
     /// Moves to the first item (the last one, if reversed).
     pub fn rewind(&mut self) {
         self.seek(&[]);
     }
+}
+
+/// Batches with fewer value log reads than this are prefetched on the
+/// iterator's thread.
+const PARALLEL_PREFETCH_MIN: usize = 16;
+
+/// Copies the value log values of `items` (the inline ones need nothing),
+/// spreading bigger batches over a few scoped threads.
+fn prefetch_values(items: &mut [Item<'_>]) {
+    let pending = items.iter().filter(|i| i.needs_prefetch()).count();
+    if pending == 0 {
+        return;
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8)
+        .min(pending / (PARALLEL_PREFETCH_MIN / 2));
+    if pending < PARALLEL_PREFETCH_MIN || threads <= 1 {
+        items
+            .iter_mut()
+            .filter(|i| i.needs_prefetch())
+            .for_each(Item::prefetch_value);
+        return;
+    }
+    let chunk = items.len().div_ceil(threads);
+    std::thread::scope(|s| {
+        for part in items.chunks_mut(chunk) {
+            s.spawn(move || {
+                part.iter_mut()
+                    .filter(|i| i.needs_prefetch())
+                    .for_each(Item::prefetch_value);
+            });
+        }
+    });
 }
 
 #[cfg(test)]

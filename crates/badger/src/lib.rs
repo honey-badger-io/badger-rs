@@ -31,6 +31,8 @@
 //! | `iterator.go` | [`iterator`] |
 //! | `dir_unix.go` | [`dir_lock`] |
 
+pub mod backup;
+pub mod batch;
 mod compaction;
 pub mod db;
 pub mod dir_lock;
@@ -43,10 +45,14 @@ mod levels;
 pub mod log_file;
 pub mod manifest;
 pub mod memtable;
+pub mod merge;
 pub mod options;
 mod oracle;
 pub mod pb;
+pub mod publisher;
 pub mod skl;
+pub mod stream;
+pub mod stream_writer;
 pub mod structs;
 pub mod table;
 pub mod trie;
@@ -55,13 +61,19 @@ pub mod util;
 pub mod vlog;
 mod write;
 
+pub use backup::KvLoader;
+pub use batch::WriteBatch;
 pub use db::DB;
 pub use error::{Error, Result};
 pub use iterator::{Item, Iterator, IteratorOptions};
 pub use levels::{LevelInfo, TableInfo};
+pub use merge::MergeOperator;
 pub use options::Options;
+pub use publisher::Subscription;
+pub use stream::Stream;
+pub use stream_writer::StreamWriter;
 pub use structs::Entry;
-pub use txn::Txn;
+pub use txn::{PendingCommit, Txn};
 
 /// The Go Badger release whose on-disk format this crate reads and writes.
 pub const GO_BADGER_VERSION: &str = "v4.9.6";

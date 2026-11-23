@@ -207,6 +207,38 @@ impl KeyRegistry {
     }
 }
 
+/// Re-encrypts the key registry in `dir` under a new master key (Go's
+/// `badger rotate`): the data keys stay the same, so tables and value log
+/// files need no rewriting. An empty `old_key` means the registry is not
+/// encrypted yet, an empty `new_key` stores the data keys unencrypted.
+/// Fails with [`Error::EncryptionKeyMismatch`] if `old_key` is wrong.
+///
+/// Unlike Go, it takes the directory lock: the DB must not be open, and it
+/// fails if `dir` has no key registry.
+pub fn rotate_master_key(dir: &Path, old_key: &[u8], new_key: &[u8]) -> Result<()> {
+    // Opening would create an empty registry: a mistyped directory must not
+    // look like a successful rotation.
+    if !dir.join(KEY_REGISTRY_FILE_NAME).is_file() {
+        return Err(Error::InvalidRequest)
+            .with_context(|| format!("no {KEY_REGISTRY_FILE_NAME} in {}", dir.display()));
+    }
+    let _lock = crate::dir_lock::DirLockGuard::acquire(dir, false)?;
+    let mut opt = KeyRegistryOptions {
+        dir: dir.to_path_buf(),
+        read_only: true,
+        encryption_key: old_key.to_vec(),
+        // Go's value; nothing is created here, so it does not matter.
+        encryption_key_rotation_duration: Duration::from_secs(10 * 24 * 3600),
+        in_memory: false,
+    };
+    let registry = KeyRegistry::open(opt.clone())?;
+    if !matches!(new_key.len(), 0 | 16 | 24 | 32) {
+        return Err(Error::InvalidEncryptionKey).context("rotating the master key");
+    }
+    opt.encryption_key = new_key.to_vec();
+    registry.rewrite(&opt)
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -77,6 +77,11 @@ impl<'db> Txn<'db> {
         }
     }
 
+    /// Managed mode: the commit timestamp to use (Go assigns `txn.commitTs`).
+    pub(crate) fn set_commit_ts(&mut self, ts: u64) {
+        self.commit_ts = ts;
+    }
+
     /// Reads at another timestamp (Go's tests assign `txn.readTs`).
     #[cfg(test)]
     pub(crate) fn set_read_ts(&mut self, ts: u64) {
@@ -123,6 +128,7 @@ impl<'db> Txn<'db> {
                     expires_at: e.expires_at,
                     meta: e.meta,
                     user_meta: e.user_meta,
+                    val: None,
                     db: self.db,
                 });
             }
@@ -146,6 +152,7 @@ impl<'db> Txn<'db> {
             expires_at: vs.expires_at,
             meta: vs.meta,
             user_meta: vs.user_meta,
+            val: None,
             db: self.db,
         })
     }
@@ -208,7 +215,40 @@ impl<'db> Txn<'db> {
         })
     }
 
-    fn modify(&mut self, mut e: Entry) -> Result<()> {
+    fn modify(&mut self, e: Entry) -> Result<()> {
+        self.try_modify(e).map_err(|err| match err {
+            ModifyError::TooBig(_) => Error::TxnTooBig,
+            ModifyError::Other(e) => e,
+        })
+    }
+
+    /// Like `modify`, but hands the entry back when the transaction is full
+    /// ([`Error::TxnTooBig`]), so a write batch can retry it in a new one.
+    pub(crate) fn try_modify(&mut self, mut e: Entry) -> std::result::Result<(), ModifyError> {
+        self.check_entry(&e).map_err(ModifyError::Other)?;
+        // The batch must fit in one write request.
+        let count = self.count + 1;
+        let size = self.size + e.estimate_size_and_set_threshold(self.db.value_threshold()) + 10;
+        let opt = &self.db.opt;
+        if count >= opt.max_batch_count() as i64 || size >= opt.max_batch_size() as i64 {
+            return Err(ModifyError::TooBig(Box::new(e)));
+        }
+        (self.count, self.size) = (count, size);
+
+        if opt.detect_conflicts {
+            self.conflict_keys.insert(fingerprint(&e.key));
+        }
+        // Managed mode can write a key at several versions in one transaction.
+        if let Some(old) = self.pending_writes.remove(&e.key)
+            && old.version != e.version
+        {
+            self.duplicate_writes.push(old);
+        }
+        self.pending_writes.insert(e.key.clone(), e);
+        Ok(())
+    }
+
+    fn check_entry(&self, e: &Entry) -> Result<()> {
         let opt = &self.db.opt;
         let exceeds = |what: &str, max: u64, len: usize| {
             Err(Error::InvalidRequest)
@@ -232,41 +272,28 @@ impl<'db> Txn<'db> {
         if opt.in_memory && e.value.len() as i64 > self.db.value_threshold() {
             return exceeds("Value", self.db.value_threshold() as u64, e.value.len());
         }
-        self.db.is_banned(&e.key)?;
-
-        // The batch must fit in one write request.
-        let count = self.count + 1;
-        let size = self.size + e.estimate_size_and_set_threshold(self.db.value_threshold()) + 10;
-        if count >= opt.max_batch_count() as i64 || size >= opt.max_batch_size() as i64 {
-            return Err(Error::TxnTooBig);
-        }
-        (self.count, self.size) = (count, size);
-
-        if opt.detect_conflicts {
-            self.conflict_keys.insert(fingerprint(&e.key));
-        }
-        // Managed mode can write a key at several versions in one transaction.
-        if let Some(old) = self.pending_writes.remove(&e.key)
-            && old.version != e.version
-        {
-            self.duplicate_writes.push(old);
-        }
-        self.pending_writes.insert(e.key.clone(), e);
-        Ok(())
+        self.db.is_banned(&e.key)
     }
 
     /// Commits the writes (a no-op for none). Fails with [`Error::Conflict`]
     /// if a key this transaction read was written by a transaction that
     /// committed after this one started.
-    pub fn commit(mut self) -> Result<()> {
+    pub fn commit(self) -> Result<()> {
+        self.start_commit()?.wait()
+    }
+
+    /// Starts committing without waiting for the write (Go's `CommitWith`,
+    /// with [`PendingCommit::wait`] in place of the callback). Conflicts and
+    /// other early failures are returned here; write errors come from
+    /// `wait`. The commit becomes visible to new transactions once written,
+    /// whether or not anyone waits for it.
+    pub fn start_commit(mut self) -> Result<PendingCommit> {
         if self.pending_writes.is_empty() {
-            return Ok(());
+            return Ok(PendingCommit { done: None });
         }
         self.commit_precheck()?;
-        let (commit_ts, done) = self.commit_and_send()?;
-        let res = done.recv().unwrap_or(Err(Error::DbClosed));
-        self.db.orc.done_commit(commit_ts);
-        res
+        let done = self.commit_and_send()?;
+        Ok(PendingCommit { done: Some(done) })
     }
 
     /// Managed mode: commits at `commit_ts` (Go's `CommitAt`).
@@ -291,9 +318,9 @@ impl<'db> Txn<'db> {
         Ok(())
     }
 
-    /// Picks the commit timestamp and queues the writes. Returns the
-    /// timestamp and the channel the writer answers on.
-    fn commit_and_send(&mut self) -> Result<(u64, crossbeam_channel::Receiver<Result<()>>)> {
+    /// Picks the commit timestamp and queues the writes. Returns the channel
+    /// the writer answers on; the writer marks the commit done.
+    fn commit_and_send(&mut self) -> Result<crossbeam_channel::Receiver<Result<()>>> {
         let orc = &self.db.orc;
         let _ordered = orc.write_ch_lock.lock().unwrap();
         let reads = std::mem::take(&mut *self.reads.lock().unwrap());
@@ -307,6 +334,8 @@ impl<'db> Txn<'db> {
         let Some(commit_ts) = orc.new_commit_ts(&req, &mut self.done_read) else {
             return Err(Error::Conflict);
         };
+        // Marks the commit done when dropped, on every path from here on.
+        let commit_mark = orc.commit_mark(commit_ts);
 
         // Entries without an explicit version (all of them, outside managed
         // mode) get the commit timestamp and are marked as one transaction.
@@ -336,13 +365,7 @@ impl<'db> Txn<'db> {
                 ..Default::default()
             });
         }
-        match self.db.send_to_write_ch(entries) {
-            Ok(rx) => Ok((commit_ts, rx)),
-            Err(e) => {
-                orc.done_commit(commit_ts);
-                Err(e)
-            }
-        }
+        self.db.send_commit_to_write_ch(entries, commit_mark)
     }
 }
 
@@ -351,6 +374,30 @@ impl Drop for Txn<'_> {
         if !self.db.orc.is_managed() && !self.done_read {
             self.done_read = true;
             self.db.orc.done_read(self.read_mark_ts);
+        }
+    }
+}
+
+/// Why [`Txn::try_modify`] refused an entry.
+pub(crate) enum ModifyError {
+    /// The transaction is full ([`Error::TxnTooBig`]); here is the entry back.
+    TooBig(Box<Entry>),
+    Other(Error),
+}
+
+/// A commit queued by [`Txn::start_commit`].
+#[must_use = "a pending commit can fail; call `wait` to see the result"]
+pub struct PendingCommit {
+    /// `None` when there was nothing to write.
+    done: Option<crossbeam_channel::Receiver<Result<()>>>,
+}
+
+impl PendingCommit {
+    /// Waits until the writes are applied and returns the outcome.
+    pub fn wait(self) -> Result<()> {
+        match self.done {
+            None => Ok(()),
+            Some(rx) => rx.recv().unwrap_or(Err(Error::DbClosed)),
         }
     }
 }

@@ -15,7 +15,6 @@
 //!   waits for the flush queue to empty.
 //! - `drop_all` does not restart table ids at 1, so a table still open in a
 //!   reader can never share a file name with a new one.
-//! - No subscriptions yet (Phase 7).
 
 use std::collections::HashSet;
 use std::fs;
@@ -34,7 +33,8 @@ use crate::levels::{LevelInfo, LevelsController, TableInfo, base_table_options};
 use crate::manifest::ManifestFile;
 use crate::memtable::{MemTable, open_mem_tables};
 use crate::options::Options;
-use crate::oracle::Oracle;
+use crate::oracle::{CommitMark, Oracle};
+use crate::publisher::{self, Publisher};
 use crate::structs::Entry;
 use crate::table::{TableOptions, new_block_cache, new_index_cache};
 use crate::txn::Txn;
@@ -52,9 +52,10 @@ pub(crate) const WRITE_CH_CAPACITY: usize = 1000;
 /// An open database. Share it between threads by reference (`&DB` is
 /// `Send`), or put it in an `Arc`.
 pub struct DB {
-    inner: Arc<DbInner>,
+    pub(crate) inner: Arc<DbInner>,
     writer: Option<JoinHandle<()>>,
     flusher: Option<JoinHandle<()>>,
+    publisher: Option<JoinHandle<()>>,
     /// `None` while stopped (and always in read-only mode).
     compactors: Mutex<Option<Compactors>>,
 }
@@ -92,6 +93,8 @@ pub(crate) struct DbInner {
     /// Queue to the flush thread.
     pub flush_tx: Sender<FlushMsg>,
     pub block_writes: AtomicBool,
+    /// Delivers writes to subscribers.
+    pub publisher: Publisher,
     /// Set while a drop runs: flushes to L0 do not wait for compaction.
     l0_stall_disabled: AtomicBool,
     banned_namespaces: RwLock<HashSet<u64>>,
@@ -166,6 +169,7 @@ impl DB {
 
         let (write_tx, write_rx) = crossbeam_channel::bounded(WRITE_CH_CAPACITY);
         let (flush_tx, flush_rx) = crossbeam_channel::bounded(opt.num_memtables.max(1));
+        let (publisher, publish_rx) = Publisher::new();
         let imm_to_flush = if opt.read_only {
             Vec::new()
         } else {
@@ -183,6 +187,7 @@ impl DB {
             write_tx: RwLock::new((!opt.read_only).then_some(write_tx)),
             flush_tx,
             block_writes: AtomicBool::new(opt.read_only),
+            publisher,
             l0_stall_disabled: AtomicBool::new(false),
             banned_namespaces: RwLock::new(HashSet::new()),
             closed: AtomicBool::new(false),
@@ -194,8 +199,15 @@ impl DB {
             inner,
             writer: None,
             flusher: None,
+            publisher: None,
             compactors: Mutex::new(None),
         };
+        let registry = Arc::clone(&db.inner.publisher.registry);
+        db.publisher = Some(
+            std::thread::Builder::new()
+                .name("badger-publish".into())
+                .spawn(move || publisher::publish_loop(&registry, publish_rx))?,
+        );
         if !db.inner.opt.read_only {
             db.start_threads(write_rx, flush_rx)?;
             db.start_compactions()?;
@@ -237,7 +249,7 @@ impl DB {
     }
 
     /// Starts the compactor threads (Go's `startCompactions`).
-    fn start_compactions(&self) -> Result<()> {
+    pub(crate) fn start_compactions(&self) -> Result<()> {
         let mut slot = self.compactors.lock().unwrap();
         if slot.is_some() || self.inner.opt.read_only {
             return Ok(());
@@ -259,7 +271,7 @@ impl DB {
 
     /// Stops the compactor threads, waiting for running compactions (Go's
     /// `stopCompactions`).
-    fn stop_compactions(&self) {
+    pub(crate) fn stop_compactions(&self) {
         let Some(c) = self.compactors.lock().unwrap().take() else {
             return;
         };
@@ -457,7 +469,7 @@ impl DB {
         res.and(started)
     }
 
-    fn flatten_inner(&self, workers: usize) -> Result<()> {
+    pub(crate) fn flatten_inner(&self, workers: usize) -> Result<()> {
         let db = &*self.inner;
         let compact_away = |cp: CompactionPriority| -> Result<()> {
             log::info!("Attempting to compact with {cp:?}");
@@ -517,7 +529,7 @@ impl DB {
 
     /// Stops writes until the returned guard is dropped: queued writes are
     /// applied and every full memtable is flushed (Go's `prepareToDrop`).
-    fn prepare_to_drop(&self) -> Result<DropGuard<'_>> {
+    pub(crate) fn prepare_to_drop(&self) -> Result<DropGuard<'_>> {
         assert!(
             !self.inner.opt.read_only,
             "Attempting to drop data in read-only mode."
@@ -548,7 +560,7 @@ impl DB {
         res.and(started)
     }
 
-    fn drop_all_inner(&self) -> Result<()> {
+    pub(crate) fn drop_all_inner(&self) -> Result<()> {
         let db = &*self.inner;
         let mut mem = db.mem.lock().unwrap();
         if let Some(mt) = mem.mt.take() {
@@ -702,6 +714,10 @@ impl DB {
         // A flush stalled on L0 gives up waiting now.
         inner.lc.signal_l0_drained();
         if inner.opt.read_only {
+            inner.publisher.close();
+            if let Some(t) = self.publisher.take() {
+                let _ = t.join();
+            }
             return Ok(());
         }
 
@@ -709,6 +725,11 @@ impl DB {
         // disconnects the channel after the queued requests.
         drop(inner.write_tx.write().unwrap().take());
         if let Some(t) = self.writer.take() {
+            let _ = t.join();
+        }
+        // No more writes to publish: end the subscriptions.
+        inner.publisher.close();
+        if let Some(t) = self.publisher.take() {
             let _ = t.join();
         }
 
@@ -838,7 +859,17 @@ impl DbInner {
 
     /// Queues `entries` as one write request (Go's `sendToWriteCh`) and
     /// returns the channel that receives its result.
-    pub(crate) fn send_to_write_ch(&self, mut entries: Vec<Entry>) -> Result<Receiver<Result<()>>> {
+    pub(crate) fn send_to_write_ch(&self, entries: Vec<Entry>) -> Result<Receiver<Result<()>>> {
+        self.send_commit_to_write_ch(entries, None)
+    }
+
+    /// Like [`DbInner::send_to_write_ch`], for a transaction whose commit
+    /// mark the writer drops after writing (or anything else on failure).
+    pub(crate) fn send_commit_to_write_ch(
+        &self,
+        mut entries: Vec<Entry>,
+        commit_mark: Option<CommitMark>,
+    ) -> Result<Receiver<Result<()>>> {
         if self.block_writes.load(Ordering::SeqCst) {
             return Err(Error::BlockedWrites);
         }
@@ -865,6 +896,7 @@ impl DbInner {
         tx.send(Request {
             entries,
             done: done_tx,
+            commit_mark,
         })
         .map_err(|_| Error::BlockedWrites)?;
         Ok(done_rx)
@@ -895,6 +927,7 @@ impl DbInner {
                 .send(Request {
                     entries: Vec::new(),
                     done: done_tx,
+                    commit_mark: None,
                 })
                 .is_ok()
             {
@@ -922,7 +955,7 @@ fn fill_tables_error() -> Error {
 }
 
 /// Undoes `prepare_to_drop` when dropped: writes resume.
-struct DropGuard<'a> {
+pub(crate) struct DropGuard<'a> {
     db: &'a DbInner,
 }
 
@@ -948,5 +981,7 @@ pub(crate) fn create_dirs(opt: &Options) -> Result<()> {
 mod compaction_tests;
 #[cfg(all(test, not(miri)))]
 mod gc_tests;
+#[cfg(all(test, not(miri)))]
+mod iterator_tests;
 #[cfg(all(test, not(miri)))]
 mod tests;
