@@ -2,7 +2,7 @@
 
 Port of [dgraph-io/badger v4.9.6](https://github.com/dgraph-io/badger/tree/v4.9.6) to Rust.
 
-**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch` done.
+**Status:** Phase 6 done (2026-11-18). Phase 7 in progress: `WriteBatch` and the merge operator done.
 
 ## Decisions
 
@@ -336,8 +336,9 @@ Deviations and findings:
 
 ### Phase 7: remaining features
 Progress: `WriteBatch` (`src/batch.rs`, Go's `batch_test.go` and the
-write batch tests of `managed_db_test.go` ported). Next: merge operator,
-iterator prefetch, Stream, StreamWriter, backup/load, Subscribe, key rotation.
+write batch tests of `managed_db_test.go` ported); merge operator
+(`src/merge.rs`, `merge_test.go` ported). Next: iterator prefetch, Stream,
+StreamWriter, backup/load, Subscribe, key rotation.
 
 Deviations and findings so far:
 - `Txn::start_commit` returns a `PendingCommit` (wait for the result with
@@ -355,6 +356,11 @@ Deviations and findings so far:
   nothing more is committed and `flush` returns the error. Unlike Go, not
   even one more transaction is committed once an error is seen, and `flush`
   waits for commits in flight even when its own commit fails.
+- `MergeOperator` borrows the DB; dropping it (or `stop`) stops its thread
+  after a last merge. The merged value is written synchronously, so it is
+  in the DB once `stop` returns (Go's `batchSetAsync` does not wait).
+  `get_merge_operator` panics on a managed DB (Go's goroutine panics on its
+  first merge instead).
 
 - Iterator prefetch, key-only iteration, `all_versions`, prefix iteration.
 - Managed mode (`managed_db.go`), `WriteBatch` (`batch.go`), merge operator (`merge.go`).

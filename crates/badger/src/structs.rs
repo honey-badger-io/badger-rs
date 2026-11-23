@@ -190,7 +190,6 @@ impl Entry {
         self
     }
 
-    #[allow(dead_code)] // used by the write path (Phase 5)
     pub(crate) fn with_merge_bit(mut self) -> Self {
         self.meta = BIT_MERGE_ENTRY;
         self
